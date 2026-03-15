@@ -227,6 +227,15 @@ void save(std::string file, array a) {
 
 /** Load array from reader in .npy format */
 array load(std::shared_ptr<io::Reader> in_stream, StreamOrDevice s) {
+  return load(in_stream, s, LoadOptions{});
+}
+
+/** Load array from reader in .npy format with options */
+array load(
+    std::shared_ptr<io::Reader> in_stream,
+    StreamOrDevice s,
+    const LoadOptions& options) {
+  (void)options;
   ////////////////////////////////////////////////////////
   // Open and check file
   if (!in_stream->good() || !in_stream->is_open()) {
@@ -329,7 +338,13 @@ array load(std::shared_ptr<io::Reader> in_stream, StreamOrDevice s) {
 
 /** Load array from file in .npy format */
 array load(std::string file, StreamOrDevice s) {
-  return load(std::make_shared<io::ParallelFileReader>(std::move(file)), s);
+  return load(file, s, LoadOptions{});
+}
+
+/** Load array from file in .npy format with options */
+array load(std::string file, StreamOrDevice s, const LoadOptions& options) {
+  return load(
+      std::make_shared<io::ParallelFileReader>(std::move(file)), s, options);
 }
 
 namespace io {

@@ -3,15 +3,365 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <numeric>
+#include <optional>
 
 #include "mlx/io/gguf.h"
+#include "mlx/io/mmap.h"
 #include "mlx/ops.h"
 
 namespace mlx::core {
 
 // https://github.com/antirez/gguf-tools/blob/af7d88d808a7608a33723fba067036202910acb3/gguflib.h#L102-L108
 constexpr int gguf_array_header_size = 12;
+
+template <typename T>
+T read_unaligned(const uint8_t* ptr) {
+  T out;
+  std::memcpy(&out, ptr, sizeof(T));
+  return out;
+}
+
+void validate_next_key_layout(const gguf_ctx* ctx) {
+  constexpr uint64_t min_key_bytes = sizeof(uint64_t) + sizeof(uint32_t);
+
+  if (ctx->off > ctx->size || (ctx->size - ctx->off) < min_key_bytes) {
+    throw std::runtime_error(
+        "[load_gguf] Malformed GGUF metadata section (truncated key header).");
+  }
+
+  uint64_t key_len = read_unaligned<uint64_t>(ctx->data + ctx->off);
+  if (key_len > (ctx->size - ctx->off - min_key_bytes)) {
+    throw std::runtime_error(
+        "[load_gguf] Malformed or unsupported GGUF key encoding.");
+  }
+}
+
+uint64_t validate_and_advance_tensor_header(
+    const gguf_ctx* ctx,
+    uint64_t offset) {
+  constexpr uint64_t name_len_bytes = sizeof(uint64_t);
+  constexpr uint64_t num_dim_bytes = sizeof(uint32_t);
+  constexpr uint64_t type_bytes = sizeof(uint32_t);
+  constexpr uint64_t tensor_offset_bytes = sizeof(uint64_t);
+
+  if (offset > ctx->size ||
+      (ctx->size - offset) <
+          name_len_bytes + num_dim_bytes + type_bytes + tensor_offset_bytes) {
+    throw std::runtime_error(
+        "[load_gguf] Malformed GGUF tensor header (truncated tensor prefix).");
+  }
+
+  uint64_t name_len = read_unaligned<uint64_t>(ctx->data + offset);
+  offset += name_len_bytes;
+  if (name_len > (ctx->size - offset)) {
+    throw std::runtime_error(
+        "[load_gguf] Malformed GGUF tensor header (name exceeds file bounds).");
+  }
+  offset += name_len;
+
+  if ((ctx->size - offset) < num_dim_bytes + type_bytes + tensor_offset_bytes) {
+    throw std::runtime_error(
+        "[load_gguf] Malformed GGUF tensor header (missing tensor fields).");
+  }
+
+  uint32_t ndim = read_unaligned<uint32_t>(ctx->data + offset);
+  offset += num_dim_bytes;
+  if (ndim == 0 || ndim > GGUF_TENSOR_MAX_DIM) {
+    throw std::runtime_error(
+        "[load_gguf] Malformed GGUF tensor header (invalid ndim).");
+  }
+
+  uint64_t dims_bytes = static_cast<uint64_t>(ndim) * sizeof(uint64_t);
+  if ((ctx->size - offset) < dims_bytes + type_bytes + tensor_offset_bytes) {
+    throw std::runtime_error(
+        "[load_gguf] Malformed GGUF tensor header (invalid dims span).");
+  }
+
+  offset += dims_bytes + type_bytes + tensor_offset_bytes;
+  return offset;
+}
+
+void validate_tensor_section_layout(const gguf_ctx* ctx) {
+  uint64_t offset = ctx->off;
+  for (uint64_t i = 0; i < ctx->left_tensors; ++i) {
+    offset = validate_and_advance_tensor_header(ctx, offset);
+  }
+}
+
+struct Nvfp4TensorRecord {
+  std::string name;
+  uint32_t rank;
+  uint64_t nbytes;
+  uint64_t offset;
+};
+
+struct Nvfp4CompatLayout {
+  std::unordered_map<std::string, std::string> metadata;
+  std::vector<Nvfp4TensorRecord> tensors;
+  uint64_t offset_bias{0};
+};
+
+bool checked_u64_add(uint64_t a, uint64_t b, uint64_t* out) {
+  if (a > (std::numeric_limits<uint64_t>::max() - b)) {
+    return false;
+  }
+  *out = a + b;
+  return true;
+}
+
+class Nvfp4Cursor {
+ public:
+  Nvfp4Cursor(const uint8_t* data, size_t size) : data_(data), size_(size) {}
+
+  template <typename T>
+  T read_scalar(const char* label) {
+    require(sizeof(T), label);
+    T value = read_unaligned<T>(data_ + offset_);
+    offset_ += sizeof(T);
+    return value;
+  }
+
+  std::string read_string(size_t len, const char* label) {
+    require(len, label);
+    std::string out(reinterpret_cast<const char*>(data_ + offset_), len);
+    offset_ += len;
+    return out;
+  }
+
+  std::string read_ascii_token(const char* label) {
+    size_t start = offset_;
+    while (offset_ < size_ && data_[offset_] >= 32 && data_[offset_] <= 126) {
+      offset_++;
+    }
+    if (offset_ == start) {
+      throw std::runtime_error(
+          std::string("[load_gguf] NVFP4 parse error: ") + label);
+    }
+    return std::string(
+        reinterpret_cast<const char*>(data_ + start), offset_ - start);
+  }
+
+  size_t offset() const {
+    return offset_;
+  }
+
+ private:
+  void require(size_t len, const char* label) const {
+    if (offset_ > size_ || len > (size_ - offset_)) {
+      throw std::runtime_error(
+          std::string("[load_gguf] NVFP4 parse error: truncated ") + label);
+    }
+  }
+
+  const uint8_t* data_{nullptr};
+  size_t size_{0};
+  size_t offset_{0};
+};
+
+bool looks_like_nvfp4_dialect(const uint8_t* data, size_t size) {
+  if (data == nullptr || size < 30) {
+    return false;
+  }
+  if (std::memcmp(data, "GGUF", 4) != 0) {
+    return false;
+  }
+  if (read_unaligned<uint32_t>(data + 4) != 3) {
+    return false;
+  }
+  return std::memcmp(data + 24, "format", 6) == 0;
+}
+
+Nvfp4CompatLayout parse_nvfp4_layout(const uint8_t* data, size_t size) {
+  Nvfp4Cursor cursor(data, size);
+  auto magic = cursor.read_string(4, "magic");
+  if (magic != "GGUF") {
+    throw std::runtime_error("[load_gguf] NVFP4 parse error: invalid magic.");
+  }
+  uint32_t version = cursor.read_scalar<uint32_t>("version");
+  if (version != 3) {
+    throw std::runtime_error(
+        "[load_gguf] NVFP4 parse error: unsupported version.");
+  }
+
+  uint64_t metadata_entries = cursor.read_scalar<uint64_t>("metadata count");
+  (void)cursor.read_scalar<uint64_t>("secondary header value");
+  if (metadata_entries == 0 || metadata_entries > 4096) {
+    throw std::runtime_error(
+        "[load_gguf] NVFP4 parse error: invalid metadata count.");
+  }
+
+  Nvfp4CompatLayout layout;
+  layout.metadata.reserve(metadata_entries);
+
+  auto first_key = cursor.read_ascii_token("first metadata key");
+  auto first_value_len =
+      cursor.read_scalar<uint64_t>("first metadata value length");
+  if (first_value_len > std::numeric_limits<size_t>::max()) {
+    throw std::runtime_error(
+        "[load_gguf] NVFP4 parse error: metadata value is too large.");
+  }
+  layout.metadata.emplace(
+      first_key,
+      cursor.read_string(
+          static_cast<size_t>(first_value_len), "first metadata value"));
+
+  for (uint64_t i = 1; i < metadata_entries; ++i) {
+    auto key_len = cursor.read_scalar<uint64_t>("metadata key length");
+    if (key_len > std::numeric_limits<size_t>::max()) {
+      throw std::runtime_error(
+          "[load_gguf] NVFP4 parse error: metadata key/value is too large.");
+    }
+    auto key = cursor.read_string(static_cast<size_t>(key_len), "metadata key");
+    auto value_len = cursor.read_scalar<uint64_t>("metadata value length");
+    if (value_len > std::numeric_limits<size_t>::max()) {
+      throw std::runtime_error(
+          "[load_gguf] NVFP4 parse error: metadata key/value is too large.");
+    }
+    auto value =
+        cursor.read_string(static_cast<size_t>(value_len), "metadata value");
+    layout.metadata.insert_or_assign(std::move(key), std::move(value));
+  }
+
+  auto format_it = layout.metadata.find("format");
+  if (format_it == layout.metadata.end() || format_it->second != "nvfp4") {
+    throw std::runtime_error(
+        "[load_gguf] NVFP4 parse error: expected metadata format=nvfp4.");
+  }
+
+  uint64_t tensor_count = cursor.read_scalar<uint64_t>("tensor count");
+  if (tensor_count == 0 || tensor_count > 1000000) {
+    throw std::runtime_error(
+        "[load_gguf] NVFP4 parse error: invalid tensor count.");
+  }
+  layout.tensors.reserve(static_cast<size_t>(tensor_count));
+
+  for (uint64_t i = 0; i < tensor_count; ++i) {
+    auto name_len = cursor.read_scalar<uint64_t>("tensor name length");
+    if (name_len == 0 || name_len > 4096 ||
+        name_len > std::numeric_limits<size_t>::max()) {
+      throw std::runtime_error(
+          "[load_gguf] NVFP4 parse error: invalid tensor name length.");
+    }
+    Nvfp4TensorRecord record;
+    record.name =
+        cursor.read_string(static_cast<size_t>(name_len), "tensor name");
+    record.rank = cursor.read_scalar<uint32_t>("tensor rank");
+    record.nbytes = cursor.read_scalar<uint64_t>("tensor nbytes");
+    record.offset = cursor.read_scalar<uint64_t>("tensor offset");
+    layout.tensors.push_back(std::move(record));
+  }
+
+  for (size_t i = 1; i < layout.tensors.size(); ++i) {
+    if (layout.tensors[i].offset < layout.tensors[i - 1].offset) {
+      throw std::runtime_error(
+          "[load_gguf] NVFP4 parse error: tensor offsets are not monotonic.");
+    }
+  }
+
+  uint64_t raw_end = 0;
+  const auto& last = layout.tensors.back();
+  if (!checked_u64_add(last.offset, last.nbytes, &raw_end)) {
+    throw std::runtime_error(
+        "[load_gguf] NVFP4 parse error: tensor offset overflow.");
+  }
+  if (raw_end > size) {
+    layout.offset_bias = raw_end - static_cast<uint64_t>(size);
+  }
+
+  const auto header_end = static_cast<uint64_t>(cursor.offset());
+  for (const auto& t : layout.tensors) {
+    if (t.offset < layout.offset_bias) {
+      throw std::runtime_error(
+          "[load_gguf] NVFP4 parse error: invalid tensor offset bias.");
+    }
+    uint64_t adjusted_offset = t.offset - layout.offset_bias;
+    uint64_t adjusted_end = 0;
+    if (!checked_u64_add(adjusted_offset, t.nbytes, &adjusted_end) ||
+        adjusted_end > size) {
+      throw std::runtime_error(
+          "[load_gguf] NVFP4 parse error: tensor range out of file bounds.");
+    }
+  }
+  if ((layout.tensors.front().offset - layout.offset_bias) < header_end) {
+    throw std::runtime_error(
+        "[load_gguf] NVFP4 parse error: tensor data overlaps headers.");
+  }
+
+  return layout;
+}
+
+GGUFLoad load_nvfp4_compat(
+    const std::shared_ptr<io::MappedFile>& mapped_file,
+    const std::string& file,
+    const LoadOptions& options) {
+  auto* bytes = reinterpret_cast<const uint8_t*>(mapped_file->data());
+  auto parsed = parse_nvfp4_layout(bytes, mapped_file->size());
+
+  std::unordered_map<std::string, GGUFMetaData> metadata;
+  metadata.reserve(parsed.metadata.size());
+  for (const auto& [key, value] : parsed.metadata) {
+    metadata.insert({key, value});
+  }
+
+  io::MmapLoadStats stats;
+  std::optional<array> mapped_base;
+  if (options.memory_map) {
+    auto mapped_file_owner = mapped_file;
+    mapped_base = io::make_mapped_base_array(
+        mapped_file->data(),
+        mapped_file->size(),
+        [mapped_file_owner](allocator::Buffer) mutable {
+          mapped_file_owner.reset();
+        });
+    if (!mapped_base.has_value()) {
+      stats.record_fallback("make_buffer_failed");
+    }
+  }
+
+  std::unordered_map<std::string, array> arrays;
+  arrays.reserve(parsed.tensors.size());
+  for (const auto& tensor : parsed.tensors) {
+    if (tensor.nbytes >
+        static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+      throw std::runtime_error(
+          "[load_gguf] NVFP4 tensor exceeds host size_t capacity.");
+    }
+    if (tensor.nbytes >
+        static_cast<uint64_t>(std::numeric_limits<ShapeElem>::max())) {
+      throw std::runtime_error(
+          "[load_gguf] NVFP4 tensor exceeds MLX shape element limits.");
+    }
+
+    size_t byte_offset =
+        static_cast<size_t>(tensor.offset - parsed.offset_bias);
+    size_t byte_count = static_cast<size_t>(tensor.nbytes);
+    Shape shape{static_cast<ShapeElem>(byte_count)};
+
+    if (mapped_base.has_value()) {
+      std::string fallback_reason;
+      auto view = io::make_mapped_view(
+          mapped_base.value(), byte_offset, shape, uint8, &fallback_reason);
+      if (view.has_value()) {
+        stats.record_mapped(view->nbytes());
+        arrays.insert({tensor.name, std::move(*view)});
+        continue;
+      }
+      stats.record_fallback(
+          fallback_reason.empty() ? "view_creation_failed" : fallback_reason);
+    }
+
+    auto buffer = allocator::malloc(byte_count);
+    std::memcpy(buffer.raw_ptr(), bytes + byte_offset, byte_count);
+    auto copied = array(buffer, shape, uint8);
+    stats.record_copied(copied.nbytes());
+    arrays.insert({tensor.name, std::move(copied)});
+  }
+
+  stats.maybe_log("gguf_nvfp4", file);
+  return {arrays, metadata};
+}
 
 std::optional<uint32_t> dtype_to_gguf_tensor_type(const Dtype& dtype) {
   switch (dtype) {
@@ -131,7 +481,6 @@ void set_mx_value_from_gguf(
       value = array(val->float64, float32);
       break;
     case GGUF_VALUE_TYPE_ARRAY: {
-      ctx->off += gguf_array_header_size; // Skip header
       char* data = reinterpret_cast<char*>(val) + gguf_array_header_size;
       auto size = static_cast<int>(val->array.len);
       if (val->array.type == GGUF_VALUE_TYPE_ARRAY) {
@@ -161,7 +510,7 @@ void set_mx_value_from_gguf(
           value = array(reinterpret_cast<uint64_t*>(data), {size}, uint64);
           break;
         case GGUF_VALUE_TYPE_INT64:
-          value = array(reinterpret_cast<uint64_t*>(data), {size}, int64);
+          value = array(reinterpret_cast<int64_t*>(data), {size}, int64);
           break;
         case GGUF_VALUE_TYPE_FLOAT32:
           value = array(reinterpret_cast<float*>(data), {size}, float32);
@@ -175,7 +524,6 @@ void set_mx_value_from_gguf(
             auto str_val = reinterpret_cast<gguf_string*>(data);
             data += (str_val->len + sizeof(gguf_string));
             str = std::string(str_val->string, static_cast<int>(str_val->len));
-            ctx->off += (str_val->len + sizeof(gguf_string));
           }
           value = std::move(strs);
           break;
@@ -193,17 +541,17 @@ void set_mx_value_from_gguf(
       throw std::runtime_error("[load_gguf] Received unexpected type.");
       break;
   }
-  if (type == GGUF_VALUE_TYPE_STRING) {
-    ctx->off += (sizeof(gguf_string) + std::get<std::string>(value).size());
-  } else if (auto pv = std::get_if<array>(&value); pv) {
-    ctx->off += pv->nbytes();
-  }
+  gguf_do_with_value(ctx, type, val, nullptr, 0, 0, nullptr);
 }
 
 std::unordered_map<std::string, GGUFMetaData> load_metadata(gguf_ctx* ctx) {
   std::unordered_map<std::string, GGUFMetaData> metadata;
-  gguf_key key;
-  while (gguf_get_key(ctx, &key)) {
+  while (ctx->left_kv > 0) {
+    validate_next_key_layout(ctx);
+    gguf_key key;
+    if (!gguf_get_key(ctx, &key)) {
+      break;
+    }
     std::string key_name = std::string(key.name, key.namelen);
     auto& val = metadata.insert({key_name, GGUFMetaData{}}).first->second;
     set_mx_value_from_gguf(ctx, key.type, key.val, val);
@@ -211,9 +559,13 @@ std::unordered_map<std::string, GGUFMetaData> load_metadata(gguf_ctx* ctx) {
   return metadata;
 }
 
-std::unordered_map<std::string, array> load_arrays(gguf_ctx* ctx) {
+std::unordered_map<std::string, array> load_arrays(
+    gguf_ctx* ctx,
+    const std::optional<array>& mapped_base,
+    io::MmapLoadStats* stats) {
   std::unordered_map<std::string, array> array_map;
-  gguf_tensor tensor;
+
+  validate_tensor_section_layout(ctx);
 
   auto check_insert = [](const auto& inserted) {
     if (!inserted.second) {
@@ -224,21 +576,67 @@ std::unordered_map<std::string, array> load_arrays(gguf_ctx* ctx) {
     }
   };
 
-  while (gguf_get_tensor(ctx, &tensor)) {
+  while (ctx->left_tensors > 0) {
+    gguf_tensor tensor;
+    if (!gguf_get_tensor(ctx, &tensor)) {
+      break;
+    }
     if (tensor.type == GGUF_TYPE_Q4_0 || tensor.type == GGUF_TYPE_Q4_1 ||
         tensor.type == GGUF_TYPE_Q8_0) {
       gguf_load_quantized(array_map, tensor);
-    } else {
-      std::string name(tensor.name, tensor.namelen);
-      const auto& [data, dtype] = extract_tensor_data(&tensor);
-      array loaded_array = array(data, get_shape(tensor), dtype);
-      check_insert(array_map.insert({name, loaded_array}));
+      if (stats) {
+        stats->record_fallback("quantized_conversion", tensor.bsize);
+      }
+      continue;
     }
+
+    std::string name(tensor.name, tensor.namelen);
+    auto equivalent_dtype = gguf_type_to_dtype(tensor.type);
+    auto shape = get_shape(tensor);
+
+    if (mapped_base.has_value() && equivalent_dtype.has_value()) {
+      std::string fallback_reason;
+      auto view = io::make_mapped_view(
+          mapped_base.value(),
+          tensor.offset,
+          shape,
+          equivalent_dtype.value(),
+          &fallback_reason);
+      if (view.has_value()) {
+        if (stats) {
+          stats->record_mapped(view->nbytes());
+        }
+        check_insert(array_map.insert({name, std::move(*view)}));
+        continue;
+      }
+
+      if (stats) {
+        stats->record_fallback(
+            fallback_reason.empty() ? "view_creation_failed" : fallback_reason);
+      }
+    } else if (stats && !equivalent_dtype.has_value()) {
+      stats->record_fallback("dtype_conversion");
+    }
+
+    const auto& [data, dtype] = extract_tensor_data(&tensor);
+    array loaded_array = array(data, std::move(shape), dtype);
+    if (stats) {
+      stats->record_copied(loaded_array.nbytes());
+    }
+    check_insert(array_map.insert({name, loaded_array}));
   }
   return array_map;
 }
 
 GGUFLoad load_gguf(const std::string& file, StreamOrDevice s) {
+  return load_gguf(file, s, LoadOptions{});
+}
+
+GGUFLoad load_gguf(
+    const std::string& file,
+    StreamOrDevice s,
+    const LoadOptions& options) {
+  (void)s;
   bool exists;
   {
     std::ifstream f(file.c_str());
@@ -248,13 +646,37 @@ GGUFLoad load_gguf(const std::string& file, StreamOrDevice s) {
     throw std::invalid_argument("[load_gguf] Failed to open " + file);
   }
 
-  std::unique_ptr<gguf_ctx, decltype(&gguf_close)> ctx(
-      gguf_open(file.data()), gguf_close);
+  if (options.gguf_nvfp4_compat) {
+    auto mapped_file = io::map_file_readonly(file);
+    auto* data = reinterpret_cast<const uint8_t*>(mapped_file->data());
+    if (looks_like_nvfp4_dialect(data, mapped_file->size())) {
+      return load_nvfp4_compat(mapped_file, file, options);
+    }
+  }
+
+  auto ctx = std::shared_ptr<gguf_ctx>(gguf_open(file.data()), gguf_close);
   if (!ctx) {
     throw std::runtime_error("[load_gguf] gguf_init failed");
   }
+
   auto metadata = load_metadata(ctx.get());
-  auto arrays = load_arrays(ctx.get());
+  if (!options.memory_map) {
+    auto arrays = load_arrays(ctx.get(), std::nullopt, nullptr);
+    return {arrays, metadata};
+  }
+
+  io::MmapLoadStats stats;
+  auto mapped_base = io::make_mapped_base_array(
+      ctx->data, ctx->size, [ctx](allocator::Buffer) mutable { ctx.reset(); });
+  if (!mapped_base.has_value()) {
+    stats.record_fallback("make_buffer_failed");
+    auto arrays = load_arrays(ctx.get(), std::nullopt, &stats);
+    stats.maybe_log("gguf", file);
+    return {arrays, metadata};
+  }
+
+  auto arrays = load_arrays(ctx.get(), mapped_base, &stats);
+  stats.maybe_log("gguf", file);
   return {arrays, metadata};
 }
 

@@ -21,6 +21,11 @@ using SafetensorsLoad = std::pair<
     std::unordered_map<std::string, array>,
     std::unordered_map<std::string, std::string>>;
 
+struct LoadOptions {
+  bool memory_map{false};
+  bool gguf_nvfp4_compat{false};
+};
+
 /** Save array to out stream in .npy format */
 MLX_API void save(std::shared_ptr<io::Writer> out_stream, array a);
 
@@ -31,14 +36,37 @@ MLX_API void save(std::string file, array a);
 MLX_API array
 load(std::shared_ptr<io::Reader> in_stream, StreamOrDevice s = {});
 
+/** Load array from reader in .npy format with extra options */
+MLX_API array load(
+    std::shared_ptr<io::Reader> in_stream,
+    StreamOrDevice s,
+    const LoadOptions& options);
+
 /** Load array from file in .npy format */
 MLX_API array load(std::string file, StreamOrDevice s = {});
+
+/** Load array from file in .npy format with extra options */
+MLX_API array
+load(std::string file, StreamOrDevice s, const LoadOptions& options);
 
 /** Load array map from .safetensors file format */
 MLX_API SafetensorsLoad
 load_safetensors(std::shared_ptr<io::Reader> in_stream, StreamOrDevice s = {});
+
+/** Load array map from .safetensors file format with extra options */
+MLX_API SafetensorsLoad load_safetensors(
+    std::shared_ptr<io::Reader> in_stream,
+    StreamOrDevice s,
+    const LoadOptions& options);
+
 MLX_API SafetensorsLoad
 load_safetensors(const std::string& file, StreamOrDevice s = {});
+
+/** Load array map from .safetensors file format with extra options */
+MLX_API SafetensorsLoad load_safetensors(
+    const std::string& file,
+    StreamOrDevice s,
+    const LoadOptions& options);
 
 MLX_API void save_safetensors(
     std::shared_ptr<io::Writer> in_stream,
@@ -52,6 +80,12 @@ MLX_API void save_safetensors(
 /** Load array map and metadata from .gguf file format */
 
 MLX_API GGUFLoad load_gguf(const std::string& file, StreamOrDevice s = {});
+
+/** Load array map and metadata from .gguf file format with extra options */
+MLX_API GGUFLoad load_gguf(
+    const std::string& file,
+    StreamOrDevice s,
+    const LoadOptions& options);
 
 MLX_API void save_gguf(
     std::string file,

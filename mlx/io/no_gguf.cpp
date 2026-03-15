@@ -4,7 +4,11 @@
 
 namespace mlx::core {
 
-GGUFLoad load_gguf(const std::string&, StreamOrDevice s) {
+GGUFLoad load_gguf(const std::string& file, StreamOrDevice s) {
+  return load_gguf(file, s, LoadOptions{});
+}
+
+GGUFLoad load_gguf(const std::string&, StreamOrDevice, const LoadOptions&) {
   throw std::runtime_error(
       "[load_gguf] Compile with MLX_BUILD_GGUF=ON to enable GGUF support.");
 }

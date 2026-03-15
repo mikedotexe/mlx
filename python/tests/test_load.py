@@ -2,6 +2,7 @@
 
 import os
 import platform
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -127,6 +128,49 @@ class TestLoad(mlx_tests.MLXTestCase):
                             mx.array_equal(load_dict["test"], save_dict["test"])
                         )
 
+    def test_load_safetensors_memory_map(self):
+        test_file = os.path.join(self.test_dir, "test_memory_map.safetensors")
+        save_dict = {
+            "f32": mx.arange(12, dtype=mx.float32).reshape(3, 4),
+            "i16": mx.arange(8, dtype=mx.int16),
+        }
+        metadata = {"source": "mapped-test"}
+        mx.save_safetensors(test_file, save_dict, metadata)
+
+        mapped, mapped_metadata = mx.load(
+            test_file, return_metadata=True, memory_map=True
+        )
+        default, default_metadata = mx.load(test_file, return_metadata=True)
+
+        self.assertEqual(mapped_metadata, metadata)
+        self.assertEqual(default_metadata, metadata)
+        self.assertEqual(mapped.keys(), default.keys())
+        for key in default.keys():
+            self.assertTrue(mx.array_equal(mapped[key], default[key]))
+
+    def test_load_safetensors_memory_map_file_object_fallback(self):
+        test_file = os.path.join(self.test_dir, "test_memory_map_fileobj.safetensors")
+        expected = mx.arange(6, dtype=mx.int16).reshape(2, 3)
+        mx.save_safetensors(test_file, {"x": expected})
+
+        with open(test_file, "rb") as f:
+            loaded = mx.load(f, format="safetensors", memory_map=True)
+        self.assertTrue(mx.array_equal(loaded["x"], expected))
+
+    def test_load_safetensors_memory_map_misaligned_offsets_fallback(self):
+        test_file = os.path.join(
+            self.test_dir, "test_memory_map_bad_offsets.safetensors"
+        )
+        header = b'{"x":{"dtype":"I16","shape":[2],"data_offsets":[1,5]}}'
+        payload = b"\x00" + np.array([123, -456], dtype=np.int16).tobytes()
+        with open(test_file, "wb") as f:
+            f.write(len(header).to_bytes(8, "little"))
+            f.write(header)
+            f.write(payload)
+
+        out = mx.load(test_file, memory_map=True)["x"]
+        self.assertTrue(mx.array_equal(out, mx.array([123, -456], dtype=mx.int16)))
+
     @unittest.skipIf(platform.system() == "Windows", "GGUF is disabled on Windows")
     def test_save_and_load_gguf(self):
         if not os.path.isdir(self.test_dir):
@@ -163,6 +207,87 @@ class TestLoad(mlx_tests.MLXTestCase):
         load_dict = mx.load(Path(save_file_mlx))
         self.assertTrue("test" in load_dict)
         self.assertTrue(mx.array_equal(load_dict["test"], save_dict["test"]))
+
+    @unittest.skipIf(platform.system() == "Windows", "GGUF is disabled on Windows")
+    def test_load_gguf_memory_map(self):
+        test_file = os.path.join(self.test_dir, "test_memory_map.gguf")
+        save_dict = {
+            "f32": mx.arange(24, dtype=mx.float32).reshape(4, 6),
+            "f16": mx.arange(10, dtype=mx.float16),
+            "i8": mx.arange(12, dtype=mx.int8),
+        }
+        metadata = {"meta": "mapped-test"}
+        mx.save_gguf(test_file, save_dict, metadata)
+
+        mapped, mapped_metadata = mx.load(
+            test_file, return_metadata=True, memory_map=True
+        )
+        default, default_metadata = mx.load(test_file, return_metadata=True)
+
+        self.assertEqual(mapped_metadata["meta"], "mapped-test")
+        self.assertEqual(default_metadata["meta"], "mapped-test")
+        self.assertEqual(mapped.keys(), default.keys())
+        for key in default.keys():
+            self.assertTrue(mx.array_equal(mapped[key], default[key]))
+
+    @unittest.skipIf(platform.system() == "Windows", "GGUF is disabled on Windows")
+    def test_load_gguf_nvfp4_compat_flag(self):
+        test_file = os.path.join(self.test_dir, "test_nvfp4_compat.gguf")
+
+        data = bytearray()
+        data.extend(b"GGUF")
+        data.extend(struct.pack("<I", 3))  # version
+        data.extend(struct.pack("<Q", 2))  # metadata count
+        data.extend(struct.pack("<Q", 0))  # secondary header field
+        data.extend(b"format")
+        data.extend(struct.pack("<Q", 5))
+        data.extend(b"nvfp4")
+        data.extend(struct.pack("<Q", 7))
+        data.extend(b"version")
+        data.extend(struct.pack("<Q", 3))
+        data.extend(b"1.0")
+        data.extend(struct.pack("<Q", 2))  # tensor count
+
+        header_end = 139
+        data.extend(struct.pack("<Q", 3))
+        data.extend(b"foo")
+        data.extend(struct.pack("<I", 1))
+        data.extend(struct.pack("<Q", 4))
+        data.extend(struct.pack("<Q", header_end))
+
+        data.extend(struct.pack("<Q", 3))
+        data.extend(b"bar")
+        data.extend(struct.pack("<I", 1))
+        data.extend(struct.pack("<Q", 4))
+        data.extend(struct.pack("<Q", header_end + 4))
+
+        data.extend(bytes([1, 2, 3, 4, 10, 11, 12, 13]))
+        with open(test_file, "wb") as f:
+            f.write(data)
+
+        with self.assertRaises(RuntimeError):
+            mx.load(test_file, format="gguf")
+
+        loaded, metadata = mx.load(
+            test_file,
+            format="gguf",
+            return_metadata=True,
+            gguf_nvfp4_compat=True,
+        )
+        self.assertEqual(metadata["format"], "nvfp4")
+        self.assertEqual(metadata["version"], "1.0")
+        self.assertTrue(
+            mx.array_equal(loaded["foo"], mx.array([1, 2, 3, 4], dtype=mx.uint8))
+        )
+        self.assertTrue(
+            mx.array_equal(loaded["bar"], mx.array([10, 11, 12, 13], dtype=mx.uint8))
+        )
+
+        mapped = mx.load(
+            test_file, format="gguf", memory_map=True, gguf_nvfp4_compat=True
+        )
+        self.assertTrue(mx.array_equal(mapped["foo"], loaded["foo"]))
+        self.assertTrue(mx.array_equal(mapped["bar"], loaded["bar"]))
 
     def test_load_f8_e4m3(self):
         if not os.path.isdir(self.test_dir):

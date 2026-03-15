@@ -1,12 +1,16 @@
 // Copyright © 2023 Apple Inc.
 //
 #include <json.hpp>
+#include <cstring>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <stack>
 
 #include "mlx/backend/cuda/cuda.h"
 #include "mlx/io.h"
 #include "mlx/io/load.h"
+#include "mlx/io/mmap.h"
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
 #include "mlx/transforms.h"
@@ -33,6 +37,44 @@ using json = nlohmann::json;
 #define ST_C64 "C64"
 
 namespace mlx::core {
+
+namespace {
+
+constexpr uint64_t kMaxJsonHeaderLength = 100000000;
+
+std::optional<size_t> checked_tensor_nbytes(const Shape& shape, Dtype dtype) {
+  size_t nelem = 1;
+  for (auto dim : shape) {
+    if (dim < 0) {
+      return std::nullopt;
+    }
+    if (dim != 0 &&
+        nelem > std::numeric_limits<size_t>::max() / static_cast<size_t>(dim)) {
+      return std::nullopt;
+    }
+    nelem *= static_cast<size_t>(dim);
+  }
+
+  if (dtype.size() != 0 &&
+      nelem > std::numeric_limits<size_t>::max() / dtype.size()) {
+    return std::nullopt;
+  }
+  return nelem * dtype.size();
+}
+
+array copy_tensor_from_bytes(
+    const char* src,
+    Shape shape,
+    Dtype dtype,
+    size_t nbytes) {
+  auto buffer = allocator::malloc(nbytes);
+  if (nbytes > 0) {
+    std::memcpy(buffer.raw_ptr(), src, nbytes);
+  }
+  return array(buffer, std::move(shape), dtype);
+}
+
+} // namespace
 
 std::string dtype_to_safetensor_str(Dtype t) {
   switch (t) {
@@ -106,6 +148,15 @@ Dtype dtype_from_safetensor_str(std::string_view str) {
 SafetensorsLoad load_safetensors(
     std::shared_ptr<io::Reader> in_stream,
     StreamOrDevice s) {
+  return load_safetensors(in_stream, s, LoadOptions{});
+}
+
+/** Load array from reader in safetensor format with options */
+SafetensorsLoad load_safetensors(
+    std::shared_ptr<io::Reader> in_stream,
+    StreamOrDevice s,
+    const LoadOptions& options) {
+  (void)options;
   ////////////////////////////////////////////////////////
   // Open and check file
   if (!in_stream->good() || !in_stream->is_open()) {
@@ -116,8 +167,6 @@ SafetensorsLoad load_safetensors(
   auto stream = cu::is_available() ? to_stream(s) : to_stream(s, Device::cpu);
 
   uint64_t jsonHeaderLength = 0;
-  // This is the same limit as in the original Rust Safetensors code.
-  constexpr uint64_t kMaxJsonHeaderLength = 100000000;
   in_stream->read(reinterpret_cast<char*>(&jsonHeaderLength), 8);
   if (jsonHeaderLength <= 0 || jsonHeaderLength >= kMaxJsonHeaderLength) {
     throw std::runtime_error(
@@ -160,7 +209,119 @@ SafetensorsLoad load_safetensors(
 }
 
 SafetensorsLoad load_safetensors(const std::string& file, StreamOrDevice s) {
-  return load_safetensors(std::make_shared<io::ParallelFileReader>(file), s);
+  return load_safetensors(file, s, LoadOptions{});
+}
+
+SafetensorsLoad load_safetensors(
+    const std::string& file,
+    StreamOrDevice s,
+    const LoadOptions& options) {
+  if (!options.memory_map) {
+    return load_safetensors(std::make_shared<io::ParallelFileReader>(file), s);
+  }
+
+  auto mapped = io::map_file_readonly(file);
+
+  const auto* data = static_cast<const char*>(mapped->data());
+  auto mapped_size = mapped->size();
+  if (mapped_size < 8) {
+    throw std::runtime_error(
+        "[load_safetensors] Invalid json header length file " + file);
+  }
+
+  uint64_t jsonHeaderLength = 0;
+  std::memcpy(&jsonHeaderLength, data, sizeof(jsonHeaderLength));
+  if (jsonHeaderLength <= 0 || jsonHeaderLength >= kMaxJsonHeaderLength ||
+      jsonHeaderLength > mapped_size - 8) {
+    throw std::runtime_error(
+        "[load_safetensors] Invalid json header length file " + file);
+  }
+
+  auto metadata = json::parse(data + 8, data + 8 + jsonHeaderLength);
+  if (!metadata.is_object()) {
+    throw std::runtime_error(
+        "[load_safetensors] Invalid json metadata file " + file);
+  }
+
+  const size_t payload_offset = static_cast<size_t>(jsonHeaderLength) + 8;
+  io::MmapLoadStats stats;
+
+  auto base = io::make_mapped_base_array(
+      mapped->data(), mapped_size, [mapped](allocator::Buffer) mutable {
+        mapped.reset();
+      });
+  const bool mapped_views_enabled = base.has_value();
+
+  std::unordered_map<std::string, array> res;
+  std::unordered_map<std::string, std::string> metadata_map;
+  for (const auto& item : metadata.items()) {
+    if (item.key() == "__metadata__") {
+      for (const auto& meta_item : item.value().items()) {
+        metadata_map.insert({meta_item.key(), meta_item.value()});
+      }
+      continue;
+    }
+
+    const std::string& dtype = item.value().at("dtype");
+    const Shape shape = item.value().at("shape");
+    const std::vector<size_t> data_offsets = item.value().at("data_offsets");
+    const Dtype type = dtype_from_safetensor_str(dtype);
+
+    if (data_offsets.size() != 2 || data_offsets[1] < data_offsets[0]) {
+      throw std::runtime_error(
+          "[load_safetensors] Invalid tensor offsets in file " + file);
+    }
+
+    std::string fallback_reason;
+    const auto expected_nbytes = checked_tensor_nbytes(shape, type);
+    if (!expected_nbytes.has_value()) {
+      fallback_reason = "size_overflow";
+    } else if (data_offsets[1] - data_offsets[0] != expected_nbytes.value()) {
+      fallback_reason = "size_mismatch";
+    } else if (data_offsets[0] > mapped_size - payload_offset) {
+      fallback_reason = "out_of_bounds";
+    }
+
+    size_t tensor_offset = payload_offset;
+    if (data_offsets[0] > std::numeric_limits<size_t>::max() - payload_offset) {
+      fallback_reason = "offset_overflow";
+    } else {
+      tensor_offset += data_offsets[0];
+    }
+    if (mapped_views_enabled && fallback_reason.empty()) {
+      std::string view_failure;
+      auto view = io::make_mapped_view(
+          *base, tensor_offset, shape, type, &view_failure);
+      if (view.has_value()) {
+        stats.record_mapped(expected_nbytes.value());
+        res.emplace(item.key(), std::move(*view));
+        continue;
+      }
+      fallback_reason =
+          view_failure.empty() ? "view_creation_failed" : view_failure;
+    }
+
+    if (fallback_reason.empty()) {
+      fallback_reason = "make_buffer_failed";
+    }
+
+    size_t copied_bytes =
+        expected_nbytes.has_value() ? expected_nbytes.value() : 0;
+    stats.record_fallback(fallback_reason, copied_bytes);
+    if (tensor_offset > mapped_size ||
+        copied_bytes > mapped_size - tensor_offset) {
+      throw std::runtime_error(
+          "[load_safetensors] Tensor payload out of bounds in file " + file);
+    }
+
+    res.emplace(
+        item.key(),
+        copy_tensor_from_bytes(
+            data + tensor_offset, shape, type, copied_bytes));
+  }
+
+  stats.maybe_log("safetensors", file);
+  return {res, metadata_map};
 }
 
 void save_safetensors(

@@ -1,6 +1,7 @@
 // Copyright © 2023 Apple Inc.
 
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <vector>
 
@@ -12,6 +13,62 @@ using namespace mlx::core;
 
 std::string get_temp_file(const std::string& name) {
   return std::filesystem::temp_directory_path().append(name).string();
+}
+
+void append_u32(std::vector<uint8_t>& out, uint32_t value) {
+  for (int i = 0; i < 4; ++i) {
+    out.push_back(static_cast<uint8_t>((value >> (8 * i)) & 0xFF));
+  }
+}
+
+void append_u64(std::vector<uint8_t>& out, uint64_t value) {
+  for (int i = 0; i < 8; ++i) {
+    out.push_back(static_cast<uint8_t>((value >> (8 * i)) & 0xFF));
+  }
+}
+
+void append_bytes(std::vector<uint8_t>& out, const std::string& value) {
+  out.insert(out.end(), value.begin(), value.end());
+}
+
+std::vector<uint8_t> make_nvfp4_fixture() {
+  // Custom NVFP4 dialect:
+  // [magic][version][metadata_count][secondary]
+  // first metadata key is unprefixed: "format"<len><value>
+  // subsequent metadata: <key_len><key><val_len><val>
+  // tensors: <name_len><name><rank><nbytes><offset>
+  std::vector<uint8_t> data;
+  append_bytes(data, "GGUF");
+  append_u32(data, 3); // version
+  append_u64(data, 2); // metadata count
+  append_u64(data, 0); // secondary header field
+
+  append_bytes(data, "format");
+  append_u64(data, 5);
+  append_bytes(data, "nvfp4");
+
+  append_u64(data, 7);
+  append_bytes(data, "version");
+  append_u64(data, 3);
+  append_bytes(data, "1.0");
+
+  append_u64(data, 2); // tensor count
+
+  constexpr uint64_t header_end = 139;
+  append_u64(data, 3);
+  append_bytes(data, "foo");
+  append_u32(data, 1);
+  append_u64(data, 4);
+  append_u64(data, header_end);
+
+  append_u64(data, 3);
+  append_bytes(data, "bar");
+  append_u32(data, 1);
+  append_u64(data, 4);
+  append_u64(data, header_end + 4);
+
+  data.insert(data.end(), {1, 2, 3, 4, 10, 11, 12, 13});
+  return data;
 }
 
 TEST_CASE("test save_safetensors") {
@@ -38,6 +95,54 @@ TEST_CASE("test save_safetensors") {
   CHECK_EQ(test2.dtype(), float32);
   CHECK_EQ(test2.shape(), Shape{2, 2});
   CHECK(array_equal(test2, ones({2, 2})).item<bool>());
+}
+
+TEST_CASE("test load_safetensors memory_map") {
+  std::string file_path = get_temp_file("test_arr_mmap.safetensors");
+  std::unordered_map<std::string, array> original{
+      {"f32", reshape(arange(12), {3, 4})}, {"i16", astype(arange(8), int16)}};
+  std::unordered_map<std::string, std::string> original_metadata{
+      {"source", "mapped-test"}};
+
+  save_safetensors(file_path, original, original_metadata);
+  LoadOptions mmap_options;
+  mmap_options.memory_map = true;
+  auto [mapped_arrays, mapped_metadata] =
+      load_safetensors(file_path, {}, mmap_options);
+  auto [default_arrays, default_metadata] = load_safetensors(file_path);
+
+  CHECK_EQ(mapped_metadata, original_metadata);
+  CHECK_EQ(default_metadata, original_metadata);
+  CHECK_EQ(mapped_arrays.size(), default_arrays.size());
+  for (const auto& [name, arr] : default_arrays) {
+    CHECK(array_equal(mapped_arrays.at(name), arr).item<bool>());
+    CHECK(mapped_arrays.at(name).is_available());
+  }
+}
+
+TEST_CASE("test load_safetensors memory_map fallback_misaligned_offsets") {
+  std::string file_path = get_temp_file("test_arr_mmap_fallback.safetensors");
+  std::string header =
+      R"({"x":{"dtype":"I16","shape":[2],"data_offsets":[1,5]}})";
+  uint64_t header_len = header.size();
+  int16_t expected_vals[] = {123, -456};
+  char prefix = 0;
+
+  {
+    std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(&header_len), sizeof(header_len));
+    out.write(header.data(), header.size());
+    out.write(&prefix, 1);
+    out.write(
+        reinterpret_cast<const char*>(expected_vals), sizeof(expected_vals));
+  }
+
+  LoadOptions mmap_options;
+  mmap_options.memory_map = true;
+  auto loaded = load_safetensors(file_path, {}, mmap_options).first;
+  CHECK_EQ(loaded.count("x"), 1);
+  CHECK(array_equal(loaded.at("x"), array({123, -456}, int16)).item<bool>());
+  CHECK(loaded.at("x").is_available());
 }
 
 TEST_CASE("test gguf") {
@@ -92,6 +197,83 @@ TEST_CASE("test gguf") {
     const auto& [loaded_weights, loaded_metadata] = load_gguf(file_path);
     CHECK(array_equal(loaded_weights.at("test"), arr).item<bool>());
   }
+}
+
+TEST_CASE("test gguf memory_map") {
+  std::string file_path = get_temp_file("test_arr_mmap.gguf");
+  using dict = std::unordered_map<std::string, array>;
+  dict original_weights = {
+      {"f16", astype(arange(16), float16)},
+      {"f32", reshape(astype(arange(24), float32), {4, 6})},
+      {"i8", astype(arange(12), int8)},
+      {"i32", reshape(astype(arange(18), int32), {3, 6})}};
+
+  std::unordered_map<std::string, GGUFMetaData> original_metadata{
+      {"meta", "mapped-test"}};
+
+  save_gguf(file_path, original_weights, original_metadata);
+  auto [default_weights, default_metadata] = load_gguf(file_path);
+
+  LoadOptions mmap_options;
+  mmap_options.memory_map = true;
+  auto [mapped_weights, mapped_metadata] =
+      load_gguf(file_path, {}, mmap_options);
+
+  CHECK_EQ(std::get<std::string>(mapped_metadata.at("meta")), "mapped-test");
+  CHECK_EQ(std::get<std::string>(default_metadata.at("meta")), "mapped-test");
+  CHECK_EQ(mapped_weights.size(), default_weights.size());
+  for (const auto& [name, arr] : default_weights) {
+    CHECK(array_equal(mapped_weights.at(name), arr).item<bool>());
+    CHECK(mapped_weights.at(name).is_available());
+  }
+}
+
+TEST_CASE("test gguf malformed key layout throws") {
+  std::string file_path = get_temp_file("test_arr_malformed.gguf");
+  const std::vector<uint8_t> malformed = {
+      'G',  'G',  'U',  'F', // magic
+      0x03, 0x00, 0x00, 0x00, // version
+      0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // tensor_count
+      0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // metadata_kv_count
+      'f',  'o',  'r',  'm',  'a',  't',  0x05, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 'n',  'v',  'f',  'p',  '4'};
+
+  {
+    std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
+    out.write(
+        reinterpret_cast<const char*>(malformed.data()), malformed.size());
+  }
+
+  CHECK_THROWS(load_gguf(file_path));
+}
+
+TEST_CASE("test gguf nvfp4 compatibility parser") {
+  std::string file_path = get_temp_file("test_arr_nvfp4_compat.gguf");
+  const auto fixture = make_nvfp4_fixture();
+  {
+    std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(fixture.data()), fixture.size());
+  }
+
+  CHECK_THROWS(load_gguf(file_path));
+
+  LoadOptions compat_options;
+  compat_options.gguf_nvfp4_compat = true;
+  auto [weights, metadata] = load_gguf(file_path, {}, compat_options);
+  CHECK_EQ(std::get<std::string>(metadata.at("format")), "nvfp4");
+  CHECK_EQ(std::get<std::string>(metadata.at("version")), "1.0");
+  CHECK_EQ(weights.size(), 2);
+  CHECK(
+      array_equal(weights.at("foo"), array({1, 2, 3, 4}, uint8)).item<bool>());
+  CHECK(array_equal(weights.at("bar"), array({10, 11, 12, 13}, uint8))
+            .item<bool>());
+
+  compat_options.memory_map = true;
+  auto [mapped_weights, mapped_metadata] =
+      load_gguf(file_path, {}, compat_options);
+  CHECK_EQ(std::get<std::string>(mapped_metadata.at("format")), "nvfp4");
+  CHECK(array_equal(mapped_weights.at("foo"), weights.at("foo")).item<bool>());
+  CHECK(array_equal(mapped_weights.at("bar"), weights.at("bar")).item<bool>());
 }
 
 TEST_CASE("test gguf metadata") {

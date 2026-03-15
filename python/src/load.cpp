@@ -183,13 +183,17 @@ class PyFileReader : public mx::io::Reader {
 std::pair<
     std::unordered_map<std::string, mx::array>,
     std::unordered_map<std::string, std::string>>
-mlx_load_safetensor_helper(nb::object file, mx::StreamOrDevice s) {
+mlx_load_safetensor_helper(
+    nb::object file,
+    mx::StreamOrDevice s,
+    bool memory_map) {
   if (is_str_or_path(file)) { // Assume .safetensors file path string
     auto file_str = nb::cast<std::string>(nb::str(file));
-    return mx::load_safetensors(file_str, s);
+    return mx::load_safetensors(file_str, s, mx::LoadOptions{memory_map});
   } else if (is_istream_object(file)) {
     // If we don't own the stream and it was passed to us, eval immediately
-    auto res = mx::load_safetensors(std::make_shared<PyFileReader>(file), s);
+    auto res = mx::load_safetensors(
+        std::make_shared<PyFileReader>(file), s, mx::LoadOptions{false});
     {
       nb::gil_scoped_release gil;
       for (auto& [key, arr] : std::get<0>(res)) {
@@ -203,10 +207,15 @@ mlx_load_safetensor_helper(nb::object file, mx::StreamOrDevice s) {
       "[load_safetensors] Input must be a file-like object, or string");
 }
 
-mx::GGUFLoad mlx_load_gguf_helper(nb::object file, mx::StreamOrDevice s) {
+mx::GGUFLoad mlx_load_gguf_helper(
+    nb::object file,
+    mx::StreamOrDevice s,
+    bool memory_map,
+    bool gguf_nvfp4_compat) {
   if (is_str_or_path(file)) { // Assume .gguf file path string
     auto file_str = nb::cast<std::string>(nb::str(file));
-    return mx::load_gguf(file_str, s);
+    return mx::load_gguf(
+        file_str, s, mx::LoadOptions{memory_map, gguf_nvfp4_compat});
   }
 
   throw std::invalid_argument("[load_gguf] Input must be a string");
@@ -255,13 +264,15 @@ std::unordered_map<std::string, mx::array> mlx_load_npz_helper(
   return array_dict;
 }
 
-mx::array mlx_load_npy_helper(nb::object file, mx::StreamOrDevice s) {
+mx::array
+mlx_load_npy_helper(nb::object file, mx::StreamOrDevice s, bool memory_map) {
   if (is_str_or_path(file)) { // Assume .npy file path string
     auto file_str = nb::cast<std::string>(nb::str(file));
-    return mx::load(file_str, s);
+    return mx::load(file_str, s, mx::LoadOptions{memory_map});
   } else if (is_istream_object(file)) {
     // If we don't own the stream and it was passed to us, eval immediately
-    auto arr = mx::load(std::make_shared<PyFileReader>(file), s);
+    auto arr = mx::load(
+        std::make_shared<PyFileReader>(file), s, mx::LoadOptions{false});
     {
       nb::gil_scoped_release gil;
       arr.eval();
@@ -276,7 +287,9 @@ LoadOutputTypes mlx_load_helper(
     nb::object file,
     std::optional<std::string> format,
     bool return_metadata,
-    mx::StreamOrDevice s) {
+    mx::StreamOrDevice s,
+    bool memory_map,
+    bool gguf_nvfp4_compat) {
   if (!format.has_value()) {
     std::string fname;
     if (is_str_or_path(file)) {
@@ -300,7 +313,7 @@ LoadOutputTypes mlx_load_helper(
         "[load] metadata not supported for format " + format.value());
   }
   if (format.value() == "safetensors") {
-    auto [dict, metadata] = mlx_load_safetensor_helper(file, s);
+    auto [dict, metadata] = mlx_load_safetensor_helper(file, s, memory_map);
     if (return_metadata) {
       return std::make_pair(dict, metadata);
     }
@@ -308,9 +321,10 @@ LoadOutputTypes mlx_load_helper(
   } else if (format.value() == "npz") {
     return mlx_load_npz_helper(file, s);
   } else if (format.value() == "npy") {
-    return mlx_load_npy_helper(file, s);
+    return mlx_load_npy_helper(file, s, memory_map);
   } else if (format.value() == "gguf") {
-    auto [weights, metadata] = mlx_load_gguf_helper(file, s);
+    auto [weights, metadata] =
+        mlx_load_gguf_helper(file, s, memory_map, gguf_nvfp4_compat);
     if (return_metadata) {
       return std::make_pair(weights, metadata);
     } else {

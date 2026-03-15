@@ -4135,8 +4135,10 @@ void init_ops(nb::module_& m) {
       "return_metadata"_a = false,
       nb::kw_only(),
       "stream"_a = nb::none(),
+      "memory_map"_a = false,
+      "gguf_nvfp4_compat"_a = false,
       nb::sig(
-          "def load(file: Union[file, str, pathlib.Path], /, format: Optional[str] = None, return_metadata: bool = False, *, stream: Union[None, Stream, Device] = None) -> Union[array, dict[str, array], Tuple[dict[str, array], dict[str, Any]]]"),
+          "def load(file: Union[file, str, pathlib.Path], /, format: Optional[str] = None, return_metadata: bool = False, *, stream: Union[None, Stream, Device] = None, memory_map: bool = False, gguf_nvfp4_compat: bool = False) -> Union[array, dict[str, array], Tuple[dict[str, array], dict[str, Any]]]"),
       R"pbdoc(
         Load array(s) from a binary file.
 
@@ -4147,10 +4149,21 @@ void init_ops(nb::module_& m) {
             file (file, str, pathlib.Path): File in which the array is saved.
             format (str, optional): Format of the file. If ``None``, the
               format is inferred from the file extension. Supported formats:
-              ``npy``, ``npz``, and ``safetensors``. Default: ``None``.
+              ``npy``, ``npz``, ``safetensors``, and ``gguf``. Default: ``None``.
             return_metadata (bool, optional): Load the metadata for formats
               which support matadata. The metadata will be returned as an
               additional dictionary. Default: ``False``.
+            stream (Stream, optional): Stream or device. Defaults to
+              ``None`` in which case the default stream of the default
+              device is used.
+            memory_map (bool, optional): If ``True``, opt into mapped loading
+              for path inputs in supported formats (currently ``safetensors``
+              and ``gguf``). File-like objects continue to use the existing
+              copy-based path. Default: ``False``.
+            gguf_nvfp4_compat (bool, optional): If ``True``, enable an
+              experimental compatibility parser for a non-standard NVFP4
+              GGUF dialect. This parser returns raw ``uint8`` tensor payloads
+              and is disabled by default. Default: ``False``.
         Returns:
             array, dict, or tuple:
                 A single array if loading from a ``.npy`` file or a dict
