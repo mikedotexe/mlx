@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <sstream>
 
@@ -235,7 +236,11 @@ array load(
     std::shared_ptr<io::Reader> in_stream,
     StreamOrDevice s,
     const LoadOptions& options) {
-  (void)options;
+  if (options.memory_map) {
+    std::cerr << "[load] memory_map=true has no effect for npy format; "
+              << "only safetensors and gguf support memory mapping."
+              << std::endl;
+  }
   ////////////////////////////////////////////////////////
   // Open and check file
   if (!in_stream->good() || !in_stream->is_open()) {

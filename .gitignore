@@ -15,7 +15,7 @@ python/mlx/core
 python/mlx/share
 python/mlx/include
 .Python
-build/
+build*/
 develop-eggs/
 dist/
 downloads/

@@ -79,3 +79,26 @@ The functions :func:`save_safetensors` and :func:`save_gguf` are similar to
    >>> a = mx.array([1.0])
    >>> b = mx.array([2.0])
    >>> mx.save_safetensors("arrays", {"a": a, "b": b})
+
+Memory-Mapped Loading
+---------------------
+
+For large safetensors and GGUF files, you can enable memory-mapped loading with
+the ``memory_map`` option. Instead of copying tensor data into new buffers, MLX
+wraps the file's memory pages directly as Metal shared buffers, avoiding extra
+allocations and copies:
+
+.. code-block:: python
+
+   >>> weights = mx.load("model.safetensors", memory_map=True)
+
+Memory mapping is supported for ``.safetensors`` and ``.gguf`` formats when
+loading from a file path. File-like objects and other formats (``.npy``,
+``.npz``) use the standard copy-based path.
+
+To see per-file statistics on how many bytes were mapped vs. copied, set the
+environment variable ``MLX_DEBUG_IO_MEMORY_MAP=1``:
+
+.. code-block:: shell
+
+   $ MLX_DEBUG_IO_MEMORY_MAP=1 python -c "import mlx.core as mx; mx.load('model.safetensors', memory_map=True)"

@@ -4160,6 +4160,12 @@ void init_ops(nb::module_& m) {
               for path inputs in supported formats (currently ``safetensors``
               and ``gguf``). File-like objects continue to use the existing
               copy-based path. Default: ``False``.
+
+              .. note::
+                 Set the environment variable ``MLX_DEBUG_IO_MEMORY_MAP=1``
+                 to print per-file statistics to stderr showing how many bytes
+                 were memory-mapped vs. copied, and the reasons for any
+                 fallbacks.
             gguf_nvfp4_compat (bool, optional): If ``True``, enable an
               experimental compatibility parser for a non-standard NVFP4
               GGUF dialect. This parser returns raw ``uint8`` tensor payloads

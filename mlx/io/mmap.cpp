@@ -100,6 +100,9 @@ MappedFile::MappedFile(std::string path) : path_(std::move(path)) {
     data_ = nullptr;
     throw std::runtime_error("[mmap] Failed to map file: " + path_);
   }
+  // Model loading iterates tensors sequentially; hint the kernel to prefetch
+  // ahead and reclaim behind the read head. Non-fatal if it fails.
+  madvise(data_, size_, MADV_SEQUENTIAL);
 #endif
 }
 

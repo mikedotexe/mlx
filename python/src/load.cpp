@@ -3,6 +3,7 @@
 #include <nanobind/stl/vector.h>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <stdexcept>
 #include <string_view>
 #include <unordered_map>
@@ -319,6 +320,11 @@ LoadOutputTypes mlx_load_helper(
     }
     return dict;
   } else if (format.value() == "npz") {
+    if (memory_map) {
+      std::cerr << "[load] memory_map=true has no effect for npz format; "
+                << "only safetensors and gguf support memory mapping."
+                << std::endl;
+    }
     return mlx_load_npz_helper(file, s);
   } else if (format.value() == "npy") {
     return mlx_load_npy_helper(file, s, memory_map);

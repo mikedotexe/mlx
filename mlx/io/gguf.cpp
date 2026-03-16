@@ -339,13 +339,21 @@ GGUFLoad load_nvfp4_compat(
     size_t byte_count = static_cast<size_t>(tensor.nbytes);
     Shape shape{static_cast<ShapeElem>(byte_count)};
 
+    auto check_insert = [](const auto& inserted) {
+      if (!inserted.second) {
+        std::ostringstream msg;
+        msg << "[load_gguf] Duplicate parameter name " << inserted.first->first;
+        throw std::runtime_error(msg.str());
+      }
+    };
+
     if (mapped_base.has_value()) {
       std::string fallback_reason;
       auto view = io::make_mapped_view(
           mapped_base.value(), byte_offset, shape, uint8, &fallback_reason);
       if (view.has_value()) {
         stats.record_mapped(view->nbytes());
-        arrays.insert({tensor.name, std::move(*view)});
+        check_insert(arrays.insert({tensor.name, std::move(*view)}));
         continue;
       }
       stats.record_fallback(
@@ -356,7 +364,7 @@ GGUFLoad load_nvfp4_compat(
     std::memcpy(buffer.raw_ptr(), bytes + byte_offset, byte_count);
     auto copied = array(buffer, shape, uint8);
     stats.record_copied(copied.nbytes());
-    arrays.insert({tensor.name, std::move(copied)});
+    check_insert(arrays.insert({tensor.name, std::move(copied)}));
   }
 
   stats.maybe_log("gguf_nvfp4", file);
