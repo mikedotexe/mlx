@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -14,6 +15,7 @@
 #include "mlx/backend/cuda/cuda.h"
 #include "mlx/io.h"
 #include "mlx/io/load.h"
+#include "mlx/io/mmap.h"
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
 #include "mlx/utils.h"
@@ -33,6 +35,21 @@ constexpr uint8_t MAGIC[] = {
     0x50,
     0x59,
 };
+
+using Clock = std::chrono::steady_clock;
+
+double elapsed_seconds(Clock::time_point start) {
+  return std::chrono::duration<double>(Clock::now() - start).count();
+}
+
+void assign_fault_delta(
+    const io::LoadFaultCounts& before,
+    const io::LoadFaultCounts& after,
+    size_t* minor_out,
+    size_t* major_out) {
+  *minor_out = after.minor_faults - before.minor_faults;
+  *major_out = after.major_faults - before.major_faults;
+}
 
 inline bool is_big_endian() {
   union ByteOrder {
@@ -236,6 +253,8 @@ array load(
     std::shared_ptr<io::Reader> in_stream,
     StreamOrDevice s,
     const LoadOptions& options) {
+  io::clear_last_mmap_load_stats();
+  io::clear_last_load_phase_stats();
   if (options.memory_map) {
     std::cerr << "[load] memory_map=true has no effect for npy format; "
               << "only safetensors and gguf support memory mapping."
@@ -251,6 +270,11 @@ array load(
 
   ////////////////////////////////////////////////////////
   // Read header and prepare array details
+  io::LoadPhaseStats phase_stats;
+  phase_stats.tag = "npy";
+  phase_stats.memory_map = false;
+  auto parse_faults_before = io::current_load_fault_counts();
+  auto parse_start = Clock::now();
 
   // Read and check magic
   char read_magic_and_ver[8];
@@ -319,9 +343,17 @@ array load(
       shape_str = "";
     }
   }
+  phase_stats.parse_seconds = elapsed_seconds(parse_start);
+  assign_fault_delta(
+      parse_faults_before,
+      io::current_load_fault_counts(),
+      &phase_stats.parse_minor_faults,
+      &phase_stats.parse_major_faults);
 
   ////////////////////////////////////////////////////////
   // Build primitive
+  auto setup_faults_before = io::current_load_fault_counts();
+  auto setup_start = Clock::now();
 
   size_t offset = 8 + header_len_size + header.length();
   bool swap_endianness = read_is_big_endian != is_big_endian();
@@ -337,6 +369,13 @@ array load(
   if (col_contiguous) {
     loaded_array = transpose(loaded_array, s);
   }
+  phase_stats.tensor_setup_seconds = elapsed_seconds(setup_start);
+  assign_fault_delta(
+      setup_faults_before,
+      io::current_load_fault_counts(),
+      &phase_stats.tensor_setup_minor_faults,
+      &phase_stats.tensor_setup_major_faults);
+  io::set_last_load_phase_stats(std::move(phase_stats));
 
   return loaded_array;
 }

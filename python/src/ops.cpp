@@ -9,10 +9,12 @@
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
+#include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
 #include "mlx/einsum.h"
+#include "mlx/io/mmap.h"
 #include "mlx/ops.h"
 #include "mlx/utils.h"
 #include "python/src/load.h"
@@ -4137,8 +4139,12 @@ void init_ops(nb::module_& m) {
       "stream"_a = nb::none(),
       "memory_map"_a = false,
       "gguf_nvfp4_compat"_a = false,
+      "mmap_small_tensor_copy_max_bytes"_a = nb::none(),
+      "mmap_hotset_promotion_top_k"_a = nb::none(),
+      "mmap_hotset_promotion_min_bytes"_a = nb::none(),
+      "mmap_prefetch_strategy"_a = "sequential",
       nb::sig(
-          "def load(file: Union[file, str, pathlib.Path], /, format: Optional[str] = None, return_metadata: bool = False, *, stream: Union[None, Stream, Device] = None, memory_map: bool = False, gguf_nvfp4_compat: bool = False) -> Union[array, dict[str, array], Tuple[dict[str, array], dict[str, Any]]]"),
+          "def load(file: Union[file, str, pathlib.Path], /, format: Optional[str] = None, return_metadata: bool = False, *, stream: Union[None, Stream, Device] = None, memory_map: bool = False, gguf_nvfp4_compat: bool = False, mmap_small_tensor_copy_max_bytes: Optional[int] = None, mmap_hotset_promotion_top_k: Optional[int] = None, mmap_hotset_promotion_min_bytes: Optional[int] = None, mmap_prefetch_strategy: str = 'sequential') -> Union[array, dict[str, array], Tuple[dict[str, array], dict[str, Any]]]"),
       R"pbdoc(
         Load array(s) from a binary file.
 
@@ -4164,12 +4170,32 @@ void init_ops(nb::module_& m) {
               .. note::
                  Set the environment variable ``MLX_DEBUG_IO_MEMORY_MAP=1``
                  to print per-file statistics to stderr showing how many bytes
-                 were memory-mapped vs. copied, and the reasons for any
-                 fallbacks.
+	             were memory-mapped vs. copied, and the reasons for any
+	                 fallbacks. Use :func:`last_mmap_load_stats` and
+	                 :func:`last_load_phase_stats` to access the same
+	                 information programmatically, along with loader phase
+	                 timings and page-fault attribution.
             gguf_nvfp4_compat (bool, optional): If ``True``, enable an
               experimental compatibility parser for a non-standard NVFP4
               GGUF dialect. This parser returns raw ``uint8`` tensor payloads
               and is disabled by default. Default: ``False``.
+            mmap_small_tensor_copy_max_bytes (int, optional): When
+              ``memory_map`` is enabled, copy mapped-eligible tensors at or
+              below this many bytes instead of creating mapped views. Useful
+              for policy experiments around small-tensor overhead. Default:
+              ``None``.
+            mmap_hotset_promotion_top_k (int, optional): When
+              ``memory_map`` is enabled, copy up to this many of the largest
+              mapped-eligible tensors into owned buffers instead of creating
+              mapped views. Useful for hybrid promotion experiments. Default:
+              ``None``.
+            mmap_hotset_promotion_min_bytes (int, optional): Minimum tensor
+              size in bytes required for
+              ``mmap_hotset_promotion_top_k`` eligibility. Default:
+              ``None``.
+            mmap_prefetch_strategy (str, optional): Prefetch hint used for
+              mapped file loads. Supported values are ``sequential``,
+              ``willneed``, and ``none``. Default: ``sequential``.
         Returns:
             array, dict, or tuple:
                 A single array if loading from a ``.npy`` file or a dict
@@ -4183,6 +4209,102 @@ void init_ops(nb::module_& m) {
           When loading unsupported quantization formats from GGUF, tensors
           will automatically cast to ``mx.float16``
       )pbdoc");
+  m.def(
+      "last_mmap_load_stats",
+      [](bool clear) -> nb::object {
+        auto stats = mx::io::last_mmap_load_stats(clear);
+        if (!stats.has_value()) {
+          return nb::none();
+        }
+        auto to_dict = [](const std::unordered_map<std::string, size_t>& values) {
+          nb::dict out;
+          for (const auto& [key, value] : values) {
+            out[nb::str(key.c_str())] = nb::int_(value);
+          }
+          return out;
+        };
+        auto to_str_dict = [](
+                               const std::unordered_map<std::string, std::string>& values) {
+          nb::dict out;
+          for (const auto& [key, value] : values) {
+            out[nb::str(key.c_str())] = nb::str(value.c_str());
+          }
+          return out;
+        };
+        nb::dict out;
+        out["mapped_bytes"] = nb::int_(stats->mapped_bytes);
+        out["copied_bytes"] = nb::int_(stats->copied_bytes);
+        out["fallback_tensors"] = nb::int_(stats->fallback_tensors);
+        out["fallback_reasons"] = to_dict(stats->fallback_reasons);
+        out["fallback_reason_bytes"] = to_dict(stats->fallback_reason_bytes);
+        out["fallback_reason_source_bytes"] =
+            to_dict(stats->fallback_reason_source_bytes);
+        out["hotset_promoted_tensors"] =
+            to_str_dict(stats->hotset_promoted_tensors);
+        out["hotset_promotion_strategy"] =
+            nb::str(stats->hotset_promotion_strategy.c_str());
+        return std::move(out);
+      },
+      nb::kw_only(),
+      "clear"_a = false,
+      nb::sig(
+          "def last_mmap_load_stats(*, clear: bool = False) -> Optional[dict[str, Any]]"),
+      R"pbdoc(
+      Return structured mmap statistics from the most recent load on the
+      current thread.
+
+      These statistics are populated by mapped ``.safetensors`` and ``.gguf``
+      loads and include mapped bytes, copied bytes, and fallback attribution.
+      Returns ``None`` if no mmap-aware load has run since the last clear.
+
+      Args:
+        clear (bool): If ``True``, clear the stored stats after reading them.
+
+      Returns:
+        dict or None: Structured mmap load statistics for the latest load.
+    )pbdoc");
+  m.def(
+      "last_load_phase_stats",
+      [](bool clear) -> nb::object {
+        auto stats = mx::io::last_load_phase_stats(clear);
+        if (!stats.has_value()) {
+          return nb::none();
+        }
+        nb::dict out;
+        out["tag"] = nb::str(stats->tag.c_str());
+        out["memory_map"] = nb::bool_(stats->memory_map);
+        out["open_map_seconds"] = nb::float_(stats->open_map_seconds);
+        out["parse_seconds"] = nb::float_(stats->parse_seconds);
+        out["tensor_setup_seconds"] = nb::float_(stats->tensor_setup_seconds);
+        out["open_map_minor_faults"] = nb::int_(stats->open_map_minor_faults);
+        out["open_map_major_faults"] = nb::int_(stats->open_map_major_faults);
+        out["parse_minor_faults"] = nb::int_(stats->parse_minor_faults);
+        out["parse_major_faults"] = nb::int_(stats->parse_major_faults);
+        out["tensor_setup_minor_faults"] =
+            nb::int_(stats->tensor_setup_minor_faults);
+        out["tensor_setup_major_faults"] =
+            nb::int_(stats->tensor_setup_major_faults);
+        return std::move(out);
+      },
+      nb::kw_only(),
+      "clear"_a = false,
+      nb::sig(
+          "def last_load_phase_stats(*, clear: bool = False) -> Optional[dict[str, Any]]"),
+      R"pbdoc(
+      Return structured loader phase timing and page-fault statistics from the
+      most recent load on the current thread.
+
+      These statistics capture loader-side phases such as file open or mapping,
+      metadata parse, and tensor setup. They complement
+      :func:`last_mmap_load_stats`, which focuses on mapped-vs-copied byte
+      attribution.
+
+      Args:
+        clear (bool): If ``True``, clear the stored stats after reading them.
+
+      Returns:
+        dict or None: Structured load phase statistics for the latest load.
+    )pbdoc");
   m.def(
       "save_safetensors",
       &mlx_save_safetensor_helper,

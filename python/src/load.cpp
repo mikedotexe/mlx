@@ -187,10 +187,19 @@ std::pair<
 mlx_load_safetensor_helper(
     nb::object file,
     mx::StreamOrDevice s,
-    bool memory_map) {
+    bool memory_map,
+    std::optional<size_t> mmap_small_tensor_copy_max_bytes,
+    std::optional<size_t> mmap_hotset_promotion_top_k,
+    std::optional<size_t> mmap_hotset_promotion_min_bytes,
+    std::string mmap_prefetch_strategy) {
   if (is_str_or_path(file)) { // Assume .safetensors file path string
     auto file_str = nb::cast<std::string>(nb::str(file));
-    return mx::load_safetensors(file_str, s, mx::LoadOptions{memory_map});
+    mx::LoadOptions options{memory_map};
+    options.mmap_small_tensor_copy_max_bytes = mmap_small_tensor_copy_max_bytes;
+    options.mmap_hotset_promotion_top_k = mmap_hotset_promotion_top_k;
+    options.mmap_hotset_promotion_min_bytes = mmap_hotset_promotion_min_bytes;
+    options.mmap_prefetch_strategy = std::move(mmap_prefetch_strategy);
+    return mx::load_safetensors(file_str, s, options);
   } else if (is_istream_object(file)) {
     // If we don't own the stream and it was passed to us, eval immediately
     auto res = mx::load_safetensors(
@@ -212,11 +221,19 @@ mx::GGUFLoad mlx_load_gguf_helper(
     nb::object file,
     mx::StreamOrDevice s,
     bool memory_map,
-    bool gguf_nvfp4_compat) {
+    bool gguf_nvfp4_compat,
+    std::optional<size_t> mmap_small_tensor_copy_max_bytes,
+    std::optional<size_t> mmap_hotset_promotion_top_k,
+    std::optional<size_t> mmap_hotset_promotion_min_bytes,
+    std::string mmap_prefetch_strategy) {
   if (is_str_or_path(file)) { // Assume .gguf file path string
     auto file_str = nb::cast<std::string>(nb::str(file));
-    return mx::load_gguf(
-        file_str, s, mx::LoadOptions{memory_map, gguf_nvfp4_compat});
+    mx::LoadOptions options{memory_map, gguf_nvfp4_compat};
+    options.mmap_small_tensor_copy_max_bytes = mmap_small_tensor_copy_max_bytes;
+    options.mmap_hotset_promotion_top_k = mmap_hotset_promotion_top_k;
+    options.mmap_hotset_promotion_min_bytes = mmap_hotset_promotion_min_bytes;
+    options.mmap_prefetch_strategy = std::move(mmap_prefetch_strategy);
+    return mx::load_gguf(file_str, s, options);
   }
 
   throw std::invalid_argument("[load_gguf] Input must be a string");
@@ -290,7 +307,11 @@ LoadOutputTypes mlx_load_helper(
     bool return_metadata,
     mx::StreamOrDevice s,
     bool memory_map,
-    bool gguf_nvfp4_compat) {
+    bool gguf_nvfp4_compat,
+    std::optional<size_t> mmap_small_tensor_copy_max_bytes,
+    std::optional<size_t> mmap_hotset_promotion_top_k,
+    std::optional<size_t> mmap_hotset_promotion_min_bytes,
+    std::string mmap_prefetch_strategy) {
   if (!format.has_value()) {
     std::string fname;
     if (is_str_or_path(file)) {
@@ -314,7 +335,14 @@ LoadOutputTypes mlx_load_helper(
         "[load] metadata not supported for format " + format.value());
   }
   if (format.value() == "safetensors") {
-    auto [dict, metadata] = mlx_load_safetensor_helper(file, s, memory_map);
+    auto [dict, metadata] = mlx_load_safetensor_helper(
+        file,
+        s,
+        memory_map,
+        mmap_small_tensor_copy_max_bytes,
+        mmap_hotset_promotion_top_k,
+        mmap_hotset_promotion_min_bytes,
+        mmap_prefetch_strategy);
     if (return_metadata) {
       return std::make_pair(dict, metadata);
     }
@@ -329,8 +357,15 @@ LoadOutputTypes mlx_load_helper(
   } else if (format.value() == "npy") {
     return mlx_load_npy_helper(file, s, memory_map);
   } else if (format.value() == "gguf") {
-    auto [weights, metadata] =
-        mlx_load_gguf_helper(file, s, memory_map, gguf_nvfp4_compat);
+    auto [weights, metadata] = mlx_load_gguf_helper(
+        file,
+        s,
+        memory_map,
+        gguf_nvfp4_compat,
+        mmap_small_tensor_copy_max_bytes,
+        mmap_hotset_promotion_top_k,
+        mmap_hotset_promotion_min_bytes,
+        mmap_prefetch_strategy);
     if (return_metadata) {
       return std::make_pair(weights, metadata);
     } else {

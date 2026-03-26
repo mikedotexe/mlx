@@ -1,11 +1,15 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <unordered_set>
+#include <vector>
 
 #include "mlx/io/gguf.h"
 #include "mlx/io/mmap.h"
@@ -15,6 +19,20 @@ namespace mlx::core {
 
 // https://github.com/antirez/gguf-tools/blob/af7d88d808a7608a33723fba067036202910acb3/gguflib.h#L102-L108
 constexpr int gguf_array_header_size = 12;
+using Clock = std::chrono::steady_clock;
+
+double elapsed_seconds(Clock::time_point start) {
+  return std::chrono::duration<double>(Clock::now() - start).count();
+}
+
+void assign_fault_delta(
+    const io::LoadFaultCounts& before,
+    const io::LoadFaultCounts& after,
+    size_t* minor_out,
+    size_t* major_out) {
+  *minor_out = after.minor_faults - before.minor_faults;
+  *major_out = after.major_faults - before.major_faults;
+}
 
 template <typename T>
 T read_unaligned(const uint8_t* ptr) {
@@ -109,6 +127,18 @@ bool checked_u64_add(uint64_t a, uint64_t b, uint64_t* out) {
   }
   *out = a + b;
   return true;
+}
+
+bool should_copy_small_tensor(const LoadOptions& options, size_t nbytes) {
+  return options.memory_map &&
+      options.mmap_small_tensor_copy_max_bytes.has_value() &&
+      nbytes <= options.mmap_small_tensor_copy_max_bytes.value();
+}
+
+bool hotset_promotion_enabled(const LoadOptions& options) {
+  return options.memory_map &&
+      options.mmap_hotset_promotion_top_k.has_value() &&
+      options.mmap_hotset_promotion_top_k.value() > 0;
 }
 
 class Nvfp4Cursor {
@@ -295,8 +325,11 @@ Nvfp4CompatLayout parse_nvfp4_layout(const uint8_t* data, size_t size) {
 GGUFLoad load_nvfp4_compat(
     const std::shared_ptr<io::MappedFile>& mapped_file,
     const std::string& file,
-    const LoadOptions& options) {
+    const LoadOptions& options,
+    io::LoadPhaseStats phase_stats) {
   auto* bytes = reinterpret_cast<const uint8_t*>(mapped_file->data());
+  auto parse_faults_before = io::current_load_fault_counts();
+  auto parse_start = Clock::now();
   auto parsed = parse_nvfp4_layout(bytes, mapped_file->size());
 
   std::unordered_map<std::string, GGUFMetaData> metadata;
@@ -304,9 +337,18 @@ GGUFLoad load_nvfp4_compat(
   for (const auto& [key, value] : parsed.metadata) {
     metadata.insert({key, value});
   }
+  phase_stats.parse_seconds = elapsed_seconds(parse_start);
+  assign_fault_delta(
+      parse_faults_before,
+      io::current_load_fault_counts(),
+      &phase_stats.parse_minor_faults,
+      &phase_stats.parse_major_faults);
 
   io::MmapLoadStats stats;
+  auto setup_faults_before = io::current_load_fault_counts();
+  auto setup_start = Clock::now();
   std::optional<array> mapped_base;
+  std::optional<std::string> base_copy_reason;
   if (options.memory_map) {
     auto mapped_file_owner = mapped_file;
     mapped_base = io::make_mapped_base_array(
@@ -316,12 +358,36 @@ GGUFLoad load_nvfp4_compat(
           mapped_file_owner.reset();
         });
     if (!mapped_base.has_value()) {
-      stats.record_fallback("make_buffer_failed");
+      base_copy_reason = "make_buffer_failed";
     }
   }
 
   std::unordered_map<std::string, array> arrays;
   arrays.reserve(parsed.tensors.size());
+  std::vector<io::HotsetPromotionCandidate> promotion_candidates;
+  if (!base_copy_reason.has_value() && mapped_base.has_value() &&
+      hotset_promotion_enabled(options)) {
+    promotion_candidates.reserve(parsed.tensors.size());
+    for (const auto& tensor : parsed.tensors) {
+      if (tensor.nbytes >
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        continue;
+      }
+      size_t byte_count = static_cast<size_t>(tensor.nbytes);
+      if (should_copy_small_tensor(options, byte_count)) {
+        continue;
+      }
+      promotion_candidates.push_back({tensor.name, byte_count});
+    }
+  }
+  const auto promoted_tensors = io::select_hotset_promotion_candidates(
+      std::move(promotion_candidates),
+      options.mmap_hotset_promotion_top_k.value_or(0),
+      options.mmap_hotset_promotion_min_bytes.value_or(0));
+  for (const auto& [name, reason] : promoted_tensors.reasons) {
+    stats.record_hotset_selection(name, reason, promoted_tensors.strategy);
+  }
+
   for (const auto& tensor : parsed.tensors) {
     if (tensor.nbytes >
         static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
@@ -347,26 +413,50 @@ GGUFLoad load_nvfp4_compat(
       }
     };
 
-    if (mapped_base.has_value()) {
-      std::string fallback_reason;
+    std::optional<std::string> fallback_reason = base_copy_reason;
+    const bool small_tensor_copy =
+        !base_copy_reason.has_value() &&
+        mapped_base.has_value() &&
+        should_copy_small_tensor(options, byte_count);
+    if (small_tensor_copy) {
+      fallback_reason = "small_tensor_threshold";
+    } else if (
+        !base_copy_reason.has_value() && mapped_base.has_value() &&
+        promoted_tensors.names.find(tensor.name) != promoted_tensors.names.end()) {
+      fallback_reason = "hotset_promotion";
+    } else if (mapped_base.has_value()) {
+      std::string view_failure_reason;
       auto view = io::make_mapped_view(
-          mapped_base.value(), byte_offset, shape, uint8, &fallback_reason);
+          mapped_base.value(), byte_offset, shape, uint8, &view_failure_reason);
       if (view.has_value()) {
         stats.record_mapped(view->nbytes());
         check_insert(arrays.insert({tensor.name, std::move(*view)}));
         continue;
       }
-      stats.record_fallback(
-          fallback_reason.empty() ? "view_creation_failed" : fallback_reason);
+      fallback_reason = view_failure_reason.empty() ? "view_creation_failed"
+                                                    : view_failure_reason;
     }
 
     auto buffer = allocator::malloc(byte_count);
     std::memcpy(buffer.raw_ptr(), bytes + byte_offset, byte_count);
     auto copied = array(buffer, shape, uint8);
-    stats.record_copied(copied.nbytes());
+    if (fallback_reason.has_value()) {
+      stats.record_fallback(
+          fallback_reason.value(), copied.nbytes(), byte_count);
+    } else {
+      stats.record_copied(copied.nbytes());
+    }
     check_insert(arrays.insert({tensor.name, std::move(copied)}));
   }
 
+  phase_stats.tensor_setup_seconds = elapsed_seconds(setup_start);
+  assign_fault_delta(
+      setup_faults_before,
+      io::current_load_fault_counts(),
+      &phase_stats.tensor_setup_minor_faults,
+      &phase_stats.tensor_setup_major_faults);
+  io::set_last_load_phase_stats(std::move(phase_stats));
+  io::set_last_mmap_load_stats(stats);
   stats.maybe_log("gguf_nvfp4", file);
   return {arrays, metadata};
 }
@@ -570,7 +660,9 @@ std::unordered_map<std::string, GGUFMetaData> load_metadata(gguf_ctx* ctx) {
 std::unordered_map<std::string, array> load_arrays(
     gguf_ctx* ctx,
     const std::optional<array>& mapped_base,
-    io::MmapLoadStats* stats) {
+    const LoadOptions& options,
+    io::MmapLoadStats* stats,
+    const std::optional<std::string>& base_copy_reason = std::nullopt) {
   std::unordered_map<std::string, array> array_map;
 
   validate_tensor_section_layout(ctx);
@@ -584,16 +676,49 @@ std::unordered_map<std::string, array> load_arrays(
     }
   };
 
+  std::vector<gguf_tensor> tensors;
+  tensors.reserve(ctx->left_tensors);
   while (ctx->left_tensors > 0) {
     gguf_tensor tensor;
     if (!gguf_get_tensor(ctx, &tensor)) {
       break;
     }
+    tensors.push_back(tensor);
+  }
+
+  std::vector<io::HotsetPromotionCandidate> promotion_candidates;
+  if (!base_copy_reason.has_value() && mapped_base.has_value() &&
+      hotset_promotion_enabled(options)) {
+    promotion_candidates.reserve(tensors.size());
+    for (const auto& tensor : tensors) {
+      auto equivalent_dtype = gguf_type_to_dtype(tensor.type);
+      if (!equivalent_dtype.has_value()) {
+        continue;
+      }
+      if (should_copy_small_tensor(options, tensor.bsize)) {
+        continue;
+      }
+      promotion_candidates.push_back(
+          {std::string(tensor.name, tensor.namelen), tensor.bsize});
+    }
+  }
+  const auto promoted_tensors = io::select_hotset_promotion_candidates(
+      std::move(promotion_candidates),
+      options.mmap_hotset_promotion_top_k.value_or(0),
+      options.mmap_hotset_promotion_min_bytes.value_or(0));
+  for (const auto& [name, reason] : promoted_tensors.reasons) {
+    if (stats) {
+      stats->record_hotset_selection(name, reason, promoted_tensors.strategy);
+    }
+  }
+
+  for (auto& tensor : tensors) {
     if (tensor.type == GGUF_TYPE_Q4_0 || tensor.type == GGUF_TYPE_Q4_1 ||
         tensor.type == GGUF_TYPE_Q8_0) {
-      gguf_load_quantized(array_map, tensor);
+      size_t materialized_bytes = gguf_load_quantized(array_map, tensor);
       if (stats) {
-        stats->record_fallback("quantized_conversion", tensor.bsize);
+        stats->record_fallback(
+            "quantized_conversion", materialized_bytes, tensor.bsize);
       }
       continue;
     }
@@ -601,15 +726,27 @@ std::unordered_map<std::string, array> load_arrays(
     std::string name(tensor.name, tensor.namelen);
     auto equivalent_dtype = gguf_type_to_dtype(tensor.type);
     auto shape = get_shape(tensor);
+    std::optional<std::string> fallback_reason;
 
-    if (mapped_base.has_value() && equivalent_dtype.has_value()) {
-      std::string fallback_reason;
+    const bool small_tensor_copy =
+        !base_copy_reason.has_value() &&
+        mapped_base.has_value() && equivalent_dtype.has_value() &&
+        should_copy_small_tensor(options, tensor.bsize);
+    if (small_tensor_copy) {
+      fallback_reason = "small_tensor_threshold";
+    } else if (
+        !base_copy_reason.has_value() && mapped_base.has_value() &&
+        equivalent_dtype.has_value() &&
+        promoted_tensors.names.find(name) != promoted_tensors.names.end()) {
+      fallback_reason = "hotset_promotion";
+    } else if (mapped_base.has_value() && equivalent_dtype.has_value()) {
+      std::string view_failure_reason;
       auto view = io::make_mapped_view(
           mapped_base.value(),
           tensor.offset,
           shape,
           equivalent_dtype.value(),
-          &fallback_reason);
+          &view_failure_reason);
       if (view.has_value()) {
         if (stats) {
           stats->record_mapped(view->nbytes());
@@ -617,19 +754,23 @@ std::unordered_map<std::string, array> load_arrays(
         check_insert(array_map.insert({name, std::move(*view)}));
         continue;
       }
-
-      if (stats) {
-        stats->record_fallback(
-            fallback_reason.empty() ? "view_creation_failed" : fallback_reason);
-      }
+      fallback_reason = view_failure_reason.empty() ? "view_creation_failed"
+                                                    : view_failure_reason;
     } else if (stats && !equivalent_dtype.has_value()) {
-      stats->record_fallback("dtype_conversion");
+      fallback_reason = "dtype_conversion";
+    } else if (stats && base_copy_reason.has_value()) {
+      fallback_reason = base_copy_reason;
     }
 
     const auto& [data, dtype] = extract_tensor_data(&tensor);
     array loaded_array = array(data, std::move(shape), dtype);
     if (stats) {
-      stats->record_copied(loaded_array.nbytes());
+      if (fallback_reason.has_value()) {
+        stats->record_fallback(
+            fallback_reason.value(), loaded_array.nbytes(), tensor.bsize);
+      } else {
+        stats->record_copied(loaded_array.nbytes());
+      }
     }
     check_insert(array_map.insert({name, loaded_array}));
   }
@@ -644,6 +785,8 @@ GGUFLoad load_gguf(
     const std::string& file,
     StreamOrDevice s,
     const LoadOptions& options) {
+  io::clear_last_mmap_load_stats();
+  io::clear_last_load_phase_stats();
   (void)s;
   bool exists;
   {
@@ -654,22 +797,69 @@ GGUFLoad load_gguf(
     throw std::invalid_argument("[load_gguf] Failed to open " + file);
   }
 
+  io::LoadPhaseStats phase_stats;
+  phase_stats.tag = "gguf";
+  phase_stats.memory_map = options.memory_map;
   if (options.gguf_nvfp4_compat) {
-    auto mapped_file = io::map_file_readonly(file);
+    auto open_map_faults_before = io::current_load_fault_counts();
+    auto open_map_start = Clock::now();
+    auto mapped_file =
+        io::map_file_readonly(file, options.mmap_prefetch_strategy);
+    phase_stats.open_map_seconds += elapsed_seconds(open_map_start);
+    size_t open_map_minor_faults = 0;
+    size_t open_map_major_faults = 0;
+    assign_fault_delta(
+        open_map_faults_before,
+        io::current_load_fault_counts(),
+        &open_map_minor_faults,
+        &open_map_major_faults);
+    phase_stats.open_map_minor_faults += open_map_minor_faults;
+    phase_stats.open_map_major_faults += open_map_major_faults;
     auto* data = reinterpret_cast<const uint8_t*>(mapped_file->data());
     if (looks_like_nvfp4_dialect(data, mapped_file->size())) {
-      return load_nvfp4_compat(mapped_file, file, options);
+      phase_stats.tag = "gguf_nvfp4";
+      return load_nvfp4_compat(
+          mapped_file, file, options, std::move(phase_stats));
     }
   }
 
+  auto open_map_faults_before = io::current_load_fault_counts();
+  auto open_map_start = Clock::now();
   auto ctx = std::shared_ptr<gguf_ctx>(gguf_open(file.data()), gguf_close);
+  phase_stats.open_map_seconds += elapsed_seconds(open_map_start);
+  size_t open_map_minor_faults = 0;
+  size_t open_map_major_faults = 0;
+  assign_fault_delta(
+      open_map_faults_before,
+      io::current_load_fault_counts(),
+      &open_map_minor_faults,
+      &open_map_major_faults);
+  phase_stats.open_map_minor_faults += open_map_minor_faults;
+  phase_stats.open_map_major_faults += open_map_major_faults;
   if (!ctx) {
     throw std::runtime_error("[load_gguf] gguf_init failed");
   }
 
+  auto parse_faults_before = io::current_load_fault_counts();
+  auto parse_start = Clock::now();
   auto metadata = load_metadata(ctx.get());
+  phase_stats.parse_seconds = elapsed_seconds(parse_start);
+  assign_fault_delta(
+      parse_faults_before,
+      io::current_load_fault_counts(),
+      &phase_stats.parse_minor_faults,
+      &phase_stats.parse_major_faults);
+  auto setup_faults_before = io::current_load_fault_counts();
+  auto setup_start = Clock::now();
   if (!options.memory_map) {
-    auto arrays = load_arrays(ctx.get(), std::nullopt, nullptr);
+    auto arrays = load_arrays(ctx.get(), std::nullopt, options, nullptr);
+    phase_stats.tensor_setup_seconds = elapsed_seconds(setup_start);
+    assign_fault_delta(
+        setup_faults_before,
+        io::current_load_fault_counts(),
+        &phase_stats.tensor_setup_minor_faults,
+        &phase_stats.tensor_setup_major_faults);
+    io::set_last_load_phase_stats(std::move(phase_stats));
     return {arrays, metadata};
   }
 
@@ -677,13 +867,33 @@ GGUFLoad load_gguf(
   auto mapped_base = io::make_mapped_base_array(
       ctx->data, ctx->size, [ctx](allocator::Buffer) mutable { ctx.reset(); });
   if (!mapped_base.has_value()) {
-    stats.record_fallback("make_buffer_failed");
-    auto arrays = load_arrays(ctx.get(), std::nullopt, &stats);
+    auto arrays = load_arrays(
+        ctx.get(),
+        std::nullopt,
+        options,
+        &stats,
+        std::string("make_buffer_failed"));
+    phase_stats.tensor_setup_seconds = elapsed_seconds(setup_start);
+    assign_fault_delta(
+        setup_faults_before,
+        io::current_load_fault_counts(),
+        &phase_stats.tensor_setup_minor_faults,
+        &phase_stats.tensor_setup_major_faults);
+    io::set_last_load_phase_stats(std::move(phase_stats));
+    io::set_last_mmap_load_stats(stats);
     stats.maybe_log("gguf", file);
     return {arrays, metadata};
   }
 
-  auto arrays = load_arrays(ctx.get(), mapped_base, &stats);
+  auto arrays = load_arrays(ctx.get(), mapped_base, options, &stats);
+  phase_stats.tensor_setup_seconds = elapsed_seconds(setup_start);
+  assign_fault_delta(
+      setup_faults_before,
+      io::current_load_fault_counts(),
+      &phase_stats.tensor_setup_minor_faults,
+      &phase_stats.tensor_setup_major_faults);
+  io::set_last_load_phase_stats(std::move(phase_stats));
+  io::set_last_mmap_load_stats(stats);
   stats.maybe_log("gguf", file);
   return {arrays, metadata};
 }

@@ -7,6 +7,7 @@
 
 #include "doctest/doctest.h"
 
+#include "mlx/io/mmap.h"
 #include "mlx/mlx.h"
 
 using namespace mlx::core;
@@ -143,6 +144,42 @@ TEST_CASE("test load_safetensors memory_map fallback_misaligned_offsets") {
   CHECK_EQ(loaded.count("x"), 1);
   CHECK(array_equal(loaded.at("x"), array({123, -456}, int16)).item<bool>());
   CHECK(loaded.at("x").is_available());
+}
+
+TEST_CASE("test hotset promotion selection is name aware") {
+  std::vector<io::HotsetPromotionCandidate> candidates = {
+      {"layers.0.self_attn.q_proj.weight", 512},
+      {"model.embed_tokens.weight", 256},
+      {"lm_head.weight", 128},
+      {"layers.0.mlp.up_proj.weight", 768},
+  };
+
+  auto selection =
+      io::select_hotset_promotion_candidates(std::move(candidates), 2, 0);
+
+  CHECK_EQ(selection.strategy, "name_aware");
+  CHECK_EQ(selection.names.size(), 2);
+  CHECK(selection.names.count("lm_head.weight") == 1);
+  CHECK(selection.names.count("model.embed_tokens.weight") == 1);
+  CHECK(selection.reasons.at("lm_head.weight").find("output_head") !=
+      std::string::npos);
+  CHECK(selection.reasons.at("model.embed_tokens.weight").find(
+            "token_embedding") != std::string::npos);
+}
+
+TEST_CASE("test hotset promotion selection respects minimum bytes") {
+  std::vector<io::HotsetPromotionCandidate> candidates = {
+      {"lm_head.weight", 128},
+      {"model.embed_tokens.weight", 64},
+      {"layers.0.self_attn.q_proj.weight", 512},
+  };
+
+  auto selection =
+      io::select_hotset_promotion_candidates(std::move(candidates), 3, 100);
+
+  CHECK(selection.names.count("model.embed_tokens.weight") == 0);
+  CHECK(selection.names.count("lm_head.weight") == 1);
+  CHECK(selection.names.count("layers.0.self_attn.q_proj.weight") == 1);
 }
 
 TEST_CASE("test gguf") {

@@ -2,6 +2,9 @@
 
 #pragma once
 
+#include <cstddef>
+#include <optional>
+#include <string>
 #include <unordered_map>
 #include <variant>
 
@@ -24,6 +27,10 @@ using SafetensorsLoad = std::pair<
 struct LoadOptions {
   bool memory_map{false};
   bool gguf_nvfp4_compat{false};
+  std::optional<size_t> mmap_small_tensor_copy_max_bytes{};
+  std::optional<size_t> mmap_hotset_promotion_top_k{};
+  std::optional<size_t> mmap_hotset_promotion_min_bytes{};
+  std::string mmap_prefetch_strategy{"sequential"};
 };
 
 /** Save array to out stream in .npy format */

@@ -1,6 +1,8 @@
 // Copyright © 2023-2024 Apple Inc.
 #pragma once
 
+#include <cstddef>
+
 #include "mlx/io.h"
 #include "mlx/primitives.h"
 #include "mlx/transforms.h"
@@ -13,7 +15,7 @@ extern "C" {
 namespace mlx::core {
 
 Shape get_shape(const gguf_tensor& tensor);
-void gguf_load_quantized(
+size_t gguf_load_quantized(
     std::unordered_map<std::string, array>& a,
     const gguf_tensor& tensor);
 

@@ -97,7 +97,7 @@ void extract_q8_0_data(
   }
 }
 
-void gguf_load_quantized(
+size_t gguf_load_quantized(
     std::unordered_map<std::string, array>& a,
     const gguf_tensor& tensor) {
   uint64_t weights_per_byte;
@@ -135,6 +135,8 @@ void gguf_load_quantized(
 
   array scales(allocator::malloc(sb_nbytes), shape, float16);
   array biases(allocator::malloc(sb_nbytes), std::move(shape), float16);
+  const size_t materialized_bytes =
+      weights.nbytes() + scales.nbytes() + biases.nbytes();
   if (tensor.type == GGUF_TYPE_Q4_0) {
     extract_q4_0_data(tensor, weights, scales, biases);
   } else if (tensor.type == GGUF_TYPE_Q4_1) {
@@ -159,6 +161,7 @@ void gguf_load_quantized(
       name.substr(0, name.length() - weight_suffix.length());
   check_insert(a.emplace(name_prefix + ".scales", std::move(scales)));
   check_insert(a.emplace(name_prefix + ".biases", std::move(biases)));
+  return materialized_bytes;
 }
 
 } // namespace mlx::core
