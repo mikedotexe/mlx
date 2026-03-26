@@ -2,16 +2,22 @@
 
 #include "mlx/io/mmap.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <sstream>
+#include <string>
+#include <string_view>
 #include <stdexcept>
 
 #ifdef _WIN32
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -21,6 +27,9 @@ namespace mlx::core::io {
 
 namespace {
 
+thread_local std::optional<MmapLoadStats> g_last_mmap_load_stats;
+thread_local std::optional<LoadPhaseStats> g_last_load_phase_stats;
+
 bool debug_enabled() {
   if (const char* value = std::getenv("MLX_DEBUG_IO_MEMORY_MAP")) {
     return std::atoi(value) != 0;
@@ -28,7 +37,224 @@ bool debug_enabled() {
   return false;
 }
 
+std::string lowercase_copy(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return value;
+}
+
+bool contains_token(
+    const std::string& lowered_name,
+    std::initializer_list<std::string_view> tokens) {
+  for (auto token : tokens) {
+    if (lowered_name.find(token) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::pair<int, std::string> hotset_name_priority(const std::string& name) {
+  const std::string lowered_name = lowercase_copy(name);
+  if (contains_token(
+          lowered_name,
+          {
+              "lm_head",
+              "output.weight",
+              "output_projection",
+              "embed_out",
+              "logits",
+          })) {
+    return {500, "output_head"};
+  }
+  if (contains_token(
+          lowered_name,
+          {
+              "model.norm",
+              "final_norm",
+              "norm_out",
+              "output_norm",
+              "ln_f",
+          })) {
+    return {450, "final_norm"};
+  }
+  if (contains_token(
+          lowered_name,
+          {
+              "tok_embeddings",
+              "token_embd",
+              "embed_tokens",
+              "word_embeddings",
+              "embedding",
+              "wte",
+          })) {
+    return {400, "token_embedding"};
+  }
+  if (contains_token(
+          lowered_name,
+          {
+              ".attn.",
+              "attention",
+              "self_attn",
+              "q_proj",
+              "k_proj",
+              "v_proj",
+              "o_proj",
+          })) {
+    return {300, "attention_path"};
+  }
+  if (contains_token(
+          lowered_name,
+          {
+              ".mlp.",
+              ".ffn.",
+              "feed_forward",
+              "gate_proj",
+              "up_proj",
+              "down_proj",
+          })) {
+    return {250, "mlp_path"};
+  }
+  return {100, "size_rank"};
+}
+
+#ifndef _WIN32
+void apply_prefetch_strategy(
+    void* data,
+    size_t size,
+    std::string_view prefetch_strategy) {
+  if (prefetch_strategy == "none") {
+    return;
+  }
+  if (prefetch_strategy == "sequential") {
+    // Model loading iterates tensors sequentially; hint the kernel to prefetch
+    // ahead and reclaim behind the read head. Non-fatal if it fails.
+    madvise(data, size, MADV_SEQUENTIAL);
+    return;
+  }
+  if (prefetch_strategy == "willneed") {
+#ifdef MADV_WILLNEED
+    // Ask the kernel to stage the mapped pages more aggressively.
+    madvise(data, size, MADV_WILLNEED);
+    return;
+#else
+    throw std::runtime_error(
+        "[mmap] MADV_WILLNEED is not supported in this build.");
+#endif
+  }
+  throw std::invalid_argument(
+      "[mmap] Unsupported prefetch strategy: " +
+      std::string(prefetch_strategy));
+}
+#endif
+
 } // namespace
+
+std::optional<MmapLoadStats> last_mmap_load_stats(bool clear) {
+  auto stats = g_last_mmap_load_stats;
+  if (clear) {
+    g_last_mmap_load_stats.reset();
+  }
+  return stats;
+}
+
+void set_last_mmap_load_stats(MmapLoadStats stats) {
+  g_last_mmap_load_stats = std::move(stats);
+}
+
+void clear_last_mmap_load_stats() {
+  g_last_mmap_load_stats.reset();
+}
+
+std::optional<LoadPhaseStats> last_load_phase_stats(bool clear) {
+  auto stats = g_last_load_phase_stats;
+  if (clear) {
+    g_last_load_phase_stats.reset();
+  }
+  return stats;
+}
+
+void set_last_load_phase_stats(LoadPhaseStats stats) {
+  g_last_load_phase_stats = std::move(stats);
+}
+
+void clear_last_load_phase_stats() {
+  g_last_load_phase_stats.reset();
+}
+
+LoadFaultCounts current_load_fault_counts() {
+#ifdef _WIN32
+  return {};
+#else
+  rusage usage {};
+  if (getrusage(RUSAGE_SELF, &usage) != 0) {
+    return {};
+  }
+  return {
+      static_cast<size_t>(usage.ru_minflt),
+      static_cast<size_t>(usage.ru_majflt),
+  };
+#endif
+}
+
+HotsetPromotionSelection select_hotset_promotion_candidates(
+    std::vector<HotsetPromotionCandidate> candidates,
+    size_t top_k,
+    size_t min_bytes) {
+  HotsetPromotionSelection selection;
+  if (top_k == 0 || candidates.empty()) {
+    return selection;
+  }
+
+  candidates.erase(
+      std::remove_if(
+          candidates.begin(),
+          candidates.end(),
+          [min_bytes](const auto& candidate) {
+            return candidate.bytes < min_bytes;
+          }),
+      candidates.end());
+  if (candidates.empty()) {
+    return selection;
+  }
+
+  struct RankedCandidate {
+    HotsetPromotionCandidate candidate;
+    int priority{0};
+    std::string reason;
+  };
+
+  std::vector<RankedCandidate> ranked;
+  ranked.reserve(candidates.size());
+  for (auto& candidate : candidates) {
+    auto [priority, reason] = hotset_name_priority(candidate.name);
+    ranked.push_back({std::move(candidate), priority, std::move(reason)});
+  }
+
+  std::sort(
+      ranked.begin(),
+      ranked.end(),
+      [](const auto& lhs, const auto& rhs) {
+        if (lhs.priority != rhs.priority) {
+          return lhs.priority > rhs.priority;
+        }
+        if (lhs.candidate.bytes != rhs.candidate.bytes) {
+          return lhs.candidate.bytes > rhs.candidate.bytes;
+        }
+        return lhs.candidate.name < rhs.candidate.name;
+      });
+
+  const size_t limit = std::min(top_k, ranked.size());
+  selection.names.reserve(limit);
+  for (size_t i = 0; i < limit; ++i) {
+    selection.names.insert(ranked[i].candidate.name);
+    std::ostringstream reason;
+    reason << ranked[i].reason << ",bytes=" << ranked[i].candidate.bytes;
+    selection.reasons.emplace(ranked[i].candidate.name, reason.str());
+  }
+  return selection;
+}
 
 void MmapLoadStats::record_mapped(size_t bytes) {
   mapped_bytes += bytes;
@@ -40,10 +266,23 @@ void MmapLoadStats::record_copied(size_t bytes) {
 
 void MmapLoadStats::record_fallback(
     const std::string& reason,
-    size_t copied_bytes_) {
+    size_t copied_bytes_,
+    std::optional<size_t> source_bytes) {
   fallback_tensors++;
   fallback_reasons[reason]++;
+  fallback_reason_bytes[reason] += copied_bytes_;
+  fallback_reason_source_bytes[reason] += source_bytes.value_or(copied_bytes_);
   copied_bytes += copied_bytes_;
+}
+
+void MmapLoadStats::record_hotset_selection(
+    const std::string& name,
+    const std::string& reason,
+    std::string strategy) {
+  hotset_promoted_tensors[name] = reason;
+  if (!strategy.empty()) {
+    hotset_promotion_strategy = std::move(strategy);
+  }
 }
 
 void MmapLoadStats::maybe_log(const std::string& tag, const std::string& file)
@@ -67,10 +306,37 @@ void MmapLoadStats::maybe_log(const std::string& tag, const std::string& file)
     }
     msg << "}";
   }
+  if (!fallback_reason_bytes.empty()) {
+    msg << " fallback_reason_bytes={";
+    bool first = true;
+    for (const auto& [reason, bytes] : fallback_reason_bytes) {
+      if (!first) {
+        msg << ",";
+      }
+      first = false;
+      msg << reason << ":" << bytes;
+    }
+    msg << "}";
+  }
+  if (!fallback_reason_source_bytes.empty()) {
+    msg << " fallback_reason_source_bytes={";
+    bool first = true;
+    for (const auto& [reason, bytes] : fallback_reason_source_bytes) {
+      if (!first) {
+        msg << ",";
+      }
+      first = false;
+      msg << reason << ":" << bytes;
+    }
+    msg << "}";
+  }
   std::cerr << msg.str() << std::endl;
 }
 
-MappedFile::MappedFile(std::string path) : path_(std::move(path)) {
+MappedFile::MappedFile(
+    std::string path,
+    std::string_view prefetch_strategy)
+    : path_(std::move(path)) {
 #ifdef _WIN32
   throw std::runtime_error(
       "[mmap] Memory mapping is not supported on Windows in this build.");
@@ -100,9 +366,7 @@ MappedFile::MappedFile(std::string path) : path_(std::move(path)) {
     data_ = nullptr;
     throw std::runtime_error("[mmap] Failed to map file: " + path_);
   }
-  // Model loading iterates tensors sequentially; hint the kernel to prefetch
-  // ahead and reclaim behind the read head. Non-fatal if it fails.
-  madvise(data_, size_, MADV_SEQUENTIAL);
+  apply_prefetch_strategy(data_, size_, prefetch_strategy);
 #endif
 }
 
@@ -117,8 +381,10 @@ MappedFile::~MappedFile() {
 #endif
 }
 
-std::shared_ptr<MappedFile> map_file_readonly(const std::string& path) {
-  return std::make_shared<MappedFile>(path);
+std::shared_ptr<MappedFile> map_file_readonly(
+    const std::string& path,
+    std::string_view prefetch_strategy) {
+  return std::make_shared<MappedFile>(path, prefetch_strategy);
 }
 
 std::optional<array>

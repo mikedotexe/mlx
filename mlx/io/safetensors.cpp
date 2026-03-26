@@ -1,11 +1,15 @@
 // Copyright © 2023 Apple Inc.
 //
 #include <json.hpp>
+#include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <stack>
+#include <unordered_set>
+#include <vector>
 
 #include "mlx/backend/cuda/cuda.h"
 #include "mlx/io.h"
@@ -41,6 +45,20 @@ namespace mlx::core {
 namespace {
 
 constexpr uint64_t kMaxJsonHeaderLength = 100000000;
+using Clock = std::chrono::steady_clock;
+
+double elapsed_seconds(Clock::time_point start) {
+  return std::chrono::duration<double>(Clock::now() - start).count();
+}
+
+void assign_fault_delta(
+    const io::LoadFaultCounts& before,
+    const io::LoadFaultCounts& after,
+    size_t* minor_out,
+    size_t* major_out) {
+  *minor_out = after.minor_faults - before.minor_faults;
+  *major_out = after.major_faults - before.major_faults;
+}
 
 std::optional<size_t> checked_tensor_nbytes(const Shape& shape, Dtype dtype) {
   size_t nelem = 1;
@@ -72,6 +90,18 @@ array copy_tensor_from_bytes(
     std::memcpy(buffer.raw_ptr(), src, nbytes);
   }
   return array(buffer, std::move(shape), dtype);
+}
+
+bool should_copy_small_tensor(const LoadOptions& options, size_t nbytes) {
+  return options.memory_map &&
+      options.mmap_small_tensor_copy_max_bytes.has_value() &&
+      nbytes <= options.mmap_small_tensor_copy_max_bytes.value();
+}
+
+bool hotset_promotion_enabled(const LoadOptions& options) {
+  return options.memory_map &&
+      options.mmap_hotset_promotion_top_k.has_value() &&
+      options.mmap_hotset_promotion_top_k.value() > 0;
 }
 
 } // namespace
@@ -156,7 +186,8 @@ SafetensorsLoad load_safetensors(
     std::shared_ptr<io::Reader> in_stream,
     StreamOrDevice s,
     const LoadOptions& options) {
-  (void)options;
+  io::clear_last_mmap_load_stats();
+  io::clear_last_load_phase_stats();
   ////////////////////////////////////////////////////////
   // Open and check file
   if (!in_stream->good() || !in_stream->is_open()) {
@@ -165,6 +196,11 @@ SafetensorsLoad load_safetensors(
   }
 
   auto stream = cu::is_available() ? to_stream(s) : to_stream(s, Device::cpu);
+  io::LoadPhaseStats phase_stats;
+  phase_stats.tag = "safetensors";
+  phase_stats.memory_map = false;
+  auto parse_faults_before = io::current_load_fault_counts();
+  auto parse_start = Clock::now();
 
   uint64_t jsonHeaderLength = 0;
   in_stream->read(reinterpret_cast<char*>(&jsonHeaderLength), 8);
@@ -181,8 +217,16 @@ SafetensorsLoad load_safetensors(
     throw std::runtime_error(
         "[load_safetensors] Invalid json metadata " + in_stream->label());
   }
+  phase_stats.parse_seconds = elapsed_seconds(parse_start);
+  assign_fault_delta(
+      parse_faults_before,
+      io::current_load_fault_counts(),
+      &phase_stats.parse_minor_faults,
+      &phase_stats.parse_major_faults);
   size_t offset = jsonHeaderLength + 8;
   // Load the arrays using metadata
+  auto setup_faults_before = io::current_load_fault_counts();
+  auto setup_start = Clock::now();
   std::unordered_map<std::string, array> res;
   std::unordered_map<std::string, std::string> metadata_map;
   for (const auto& item : metadata.items()) {
@@ -203,8 +247,15 @@ SafetensorsLoad load_safetensors(
              type,
              std::make_shared<Load>(
                  stream, in_stream, offset + data_offsets.at(0), false),
-             std::vector<array>{})});
+                 std::vector<array>{})});
   }
+  phase_stats.tensor_setup_seconds = elapsed_seconds(setup_start);
+  assign_fault_delta(
+      setup_faults_before,
+      io::current_load_fault_counts(),
+      &phase_stats.tensor_setup_minor_faults,
+      &phase_stats.tensor_setup_major_faults);
+  io::set_last_load_phase_stats(std::move(phase_stats));
   return {res, metadata_map};
 }
 
@@ -216,14 +267,34 @@ SafetensorsLoad load_safetensors(
     const std::string& file,
     StreamOrDevice s,
     const LoadOptions& options) {
+  io::clear_last_mmap_load_stats();
+  io::clear_last_load_phase_stats();
   if (!options.memory_map) {
-    return load_safetensors(std::make_shared<io::ParallelFileReader>(file), s);
+    return load_safetensors(
+        std::make_shared<io::ParallelFileReader>(file), s, options);
   }
 
-  auto mapped = io::map_file_readonly(file);
+  io::LoadPhaseStats phase_stats;
+  phase_stats.tag = "safetensors";
+  phase_stats.memory_map = true;
+  auto open_map_faults_before = io::current_load_fault_counts();
+  auto open_map_start = Clock::now();
+  auto mapped = io::map_file_readonly(file, options.mmap_prefetch_strategy);
+  auto mapped_size = mapped->size();
+  auto base = io::make_mapped_base_array(
+      mapped->data(), mapped_size, [mapped](allocator::Buffer) mutable {
+        mapped.reset();
+      });
+  phase_stats.open_map_seconds = elapsed_seconds(open_map_start);
+  assign_fault_delta(
+      open_map_faults_before,
+      io::current_load_fault_counts(),
+      &phase_stats.open_map_minor_faults,
+      &phase_stats.open_map_major_faults);
 
   const auto* data = static_cast<const char*>(mapped->data());
-  auto mapped_size = mapped->size();
+  auto parse_faults_before = io::current_load_fault_counts();
+  auto parse_start = Clock::now();
   if (mapped_size < 8) {
     throw std::runtime_error(
         "[load_safetensors] Invalid json header length file " + file);
@@ -242,23 +313,76 @@ SafetensorsLoad load_safetensors(
     throw std::runtime_error(
         "[load_safetensors] Invalid json metadata file " + file);
   }
+  phase_stats.parse_seconds = elapsed_seconds(parse_start);
+  assign_fault_delta(
+      parse_faults_before,
+      io::current_load_fault_counts(),
+      &phase_stats.parse_minor_faults,
+      &phase_stats.parse_major_faults);
 
   const size_t payload_offset = static_cast<size_t>(jsonHeaderLength) + 8;
   io::MmapLoadStats stats;
-
-  auto base = io::make_mapped_base_array(
-      mapped->data(), mapped_size, [mapped](allocator::Buffer) mutable {
-        mapped.reset();
-      });
   const bool mapped_views_enabled = base.has_value();
 
+  auto setup_faults_before = io::current_load_fault_counts();
+  auto setup_start = Clock::now();
   std::unordered_map<std::string, array> res;
   std::unordered_map<std::string, std::string> metadata_map;
+  std::vector<io::HotsetPromotionCandidate> promotion_candidates;
   for (const auto& item : metadata.items()) {
     if (item.key() == "__metadata__") {
       for (const auto& meta_item : item.value().items()) {
         metadata_map.insert({meta_item.key(), meta_item.value()});
       }
+      continue;
+    }
+    if (!mapped_views_enabled || !hotset_promotion_enabled(options)) {
+      continue;
+    }
+
+    const std::string& dtype = item.value().at("dtype");
+    const Shape shape = item.value().at("shape");
+    const std::vector<size_t> data_offsets = item.value().at("data_offsets");
+    const Dtype type = dtype_from_safetensor_str(dtype);
+    if (data_offsets.size() != 2 || data_offsets[1] < data_offsets[0]) {
+      continue;
+    }
+
+    const auto expected_nbytes = checked_tensor_nbytes(shape, type);
+    if (!expected_nbytes.has_value()) {
+      continue;
+    }
+    if (data_offsets[1] - data_offsets[0] != expected_nbytes.value()) {
+      continue;
+    }
+    if (data_offsets[0] > mapped_size - payload_offset) {
+      continue;
+    }
+
+    size_t tensor_offset = payload_offset;
+    if (data_offsets[0] > std::numeric_limits<size_t>::max() - payload_offset) {
+      continue;
+    }
+    tensor_offset += data_offsets[0];
+    if (tensor_offset > mapped_size ||
+        expected_nbytes.value() > mapped_size - tensor_offset) {
+      continue;
+    }
+    if (should_copy_small_tensor(options, expected_nbytes.value())) {
+      continue;
+    }
+    promotion_candidates.push_back({item.key(), expected_nbytes.value()});
+  }
+  const auto promoted_tensors = io::select_hotset_promotion_candidates(
+      std::move(promotion_candidates),
+      options.mmap_hotset_promotion_top_k.value_or(0),
+      options.mmap_hotset_promotion_min_bytes.value_or(0));
+  for (const auto& [name, reason] : promoted_tensors.reasons) {
+    stats.record_hotset_selection(name, reason, promoted_tensors.strategy);
+  }
+
+  for (const auto& item : metadata.items()) {
+    if (item.key() == "__metadata__") {
       continue;
     }
 
@@ -288,6 +412,14 @@ SafetensorsLoad load_safetensors(
     } else {
       tensor_offset += data_offsets[0];
     }
+    if (mapped_views_enabled && fallback_reason.empty() &&
+        should_copy_small_tensor(options, expected_nbytes.value())) {
+      fallback_reason = "small_tensor_threshold";
+    } else if (
+        mapped_views_enabled && fallback_reason.empty() &&
+        promoted_tensors.names.find(item.key()) != promoted_tensors.names.end()) {
+      fallback_reason = "hotset_promotion";
+    }
     if (mapped_views_enabled && fallback_reason.empty()) {
       std::string view_failure;
       auto view = io::make_mapped_view(
@@ -307,7 +439,7 @@ SafetensorsLoad load_safetensors(
 
     size_t copied_bytes =
         expected_nbytes.has_value() ? expected_nbytes.value() : 0;
-    stats.record_fallback(fallback_reason, copied_bytes);
+    stats.record_fallback(fallback_reason, copied_bytes, copied_bytes);
     if (tensor_offset > mapped_size ||
         copied_bytes > mapped_size - tensor_offset) {
       throw std::runtime_error(
@@ -320,6 +452,14 @@ SafetensorsLoad load_safetensors(
             data + tensor_offset, shape, type, copied_bytes));
   }
 
+  phase_stats.tensor_setup_seconds = elapsed_seconds(setup_start);
+  assign_fault_delta(
+      setup_faults_before,
+      io::current_load_fault_counts(),
+      &phase_stats.tensor_setup_minor_faults,
+      &phase_stats.tensor_setup_major_faults);
+  io::set_last_load_phase_stats(std::move(phase_stats));
+  io::set_last_mmap_load_stats(stats);
   stats.maybe_log("safetensors", file);
   return {res, metadata_map};
 }

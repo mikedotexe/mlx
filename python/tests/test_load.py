@@ -33,10 +33,45 @@ class TestLoad(mlx_tests.MLXTestCase):
         cls.test_dir = cls.test_dir_fid.name
         if not os.path.isdir(cls.test_dir):
             os.mkdir(cls.test_dir)
+        cls._direct_mmap_view_supported = False
+        cls._direct_mmap_view_probe_reason = None
+        if hasattr(mx, "last_mmap_load_stats"):
+            probe_file = os.path.join(cls.test_dir, "test_last_mmap_probe.safetensors")
+            probe_arr = mx.arange(8, dtype=mx.float32).reshape(2, 4)
+            mx.save_safetensors(probe_file, {"weights": probe_arr})
+            mx.last_mmap_load_stats(clear=True)
+            mx.load(probe_file, memory_map=True)
+            stats = mx.last_mmap_load_stats(clear=True) or {}
+            cls._direct_mmap_view_supported = bool(
+                int(stats.get("mapped_bytes") or 0) > 0
+            )
+            fallback_reasons = stats.get("fallback_reasons") or {}
+            if fallback_reasons:
+                cls._direct_mmap_view_probe_reason = next(iter(fallback_reasons))
 
     @classmethod
     def tearDownClass(cls):
         cls.test_dir_fid.cleanup()
+
+    def _write_quantized_q4_0_gguf_fixture(self, path):
+        tensor_name = b"quant.weight"
+        header = bytearray()
+        header.extend(b"GGUF")
+        header.extend(struct.pack("<I", 3))
+        header.extend(struct.pack("<Q", 1))  # tensor_count
+        header.extend(struct.pack("<Q", 0))  # metadata_kv_count
+        header.extend(struct.pack("<Q", len(tensor_name)))
+        header.extend(tensor_name)
+        header.extend(struct.pack("<I", 1))  # ndim
+        header.extend(struct.pack("<Q", 32))  # dim0
+        header.extend(struct.pack("<I", 2))  # GGUF_TYPE_Q4_0
+        header.extend(struct.pack("<Q", 0))  # tensor data offset
+        aligned_header = ((len(header) + 31) // 32) * 32
+        header.extend(b"\x00" * (aligned_header - len(header)))
+        block = struct.pack("<e", 0.5) + bytes(range(16))
+        with open(path, "wb") as f:
+            f.write(header)
+            f.write(block)
 
     def test_save_and_load(self):
         for dt in self.dtypes:
@@ -171,6 +206,135 @@ class TestLoad(mlx_tests.MLXTestCase):
         out = mx.load(test_file, memory_map=True)["x"]
         self.assertTrue(mx.array_equal(out, mx.array([123, -456], dtype=mx.int16)))
 
+    @unittest.skipUnless(
+        hasattr(mx, "last_mmap_load_stats"), "requires rebuilt mlx.core"
+    )
+    def test_last_mmap_load_stats_safetensors_misaligned_offset_reason(self):
+        if not self._direct_mmap_view_supported:
+            self.skipTest(
+                "current backend cannot materialize mapped safetensors views "
+                f"({self._direct_mmap_view_probe_reason or 'unknown reason'})"
+            )
+        test_file = os.path.join(
+            self.test_dir, "test_last_mmap_stats_bad_offsets.safetensors"
+        )
+        header = b'{"x":{"dtype":"I16","shape":[2],"data_offsets":[1,5]}}'
+        payload = b"\x00" + np.array([123, -456], dtype=np.int16).tobytes()
+        with open(test_file, "wb") as f:
+            f.write(len(header).to_bytes(8, "little"))
+            f.write(header)
+            f.write(payload)
+
+        mx.last_mmap_load_stats(clear=True)
+        loaded = mx.load(test_file, memory_map=True)
+        stats = mx.last_mmap_load_stats(clear=True)
+
+        self.assertTrue(mx.array_equal(loaded["x"], mx.array([123, -456], dtype=mx.int16)))
+        self.assertIsNotNone(stats)
+        self.assertEqual(stats["fallback_reasons"].get("misaligned_offset"), 1)
+
+    @unittest.skipUnless(
+        hasattr(mx, "last_mmap_load_stats"), "requires rebuilt mlx.core"
+    )
+    def test_last_mmap_load_stats_safetensors_memory_map(self):
+        test_file = os.path.join(self.test_dir, "test_last_mmap_stats.safetensors")
+        expected = mx.arange(12, dtype=mx.float32).reshape(3, 4)
+        mx.save_safetensors(test_file, {"weights": expected})
+
+        self.assertIsNone(mx.last_mmap_load_stats(clear=True))
+
+        loaded = mx.load(test_file, memory_map=True)
+        stats = mx.last_mmap_load_stats(clear=True)
+
+        self.assertTrue(mx.array_equal(loaded["weights"], expected))
+        self.assertIsNotNone(stats)
+        if self._direct_mmap_view_supported:
+            self.assertGreater(stats["mapped_bytes"], 0)
+        else:
+            self.assertEqual(stats["mapped_bytes"], 0)
+            self.assertEqual(stats["fallback_reasons"].get("make_buffer_failed"), 1)
+        self.assertGreaterEqual(stats["copied_bytes"], 0)
+        self.assertIn("fallback_tensors", stats)
+        self.assertIn("fallback_reasons", stats)
+        self.assertIn("fallback_reason_bytes", stats)
+        self.assertIn("fallback_reason_source_bytes", stats)
+        self.assertIn("hotset_promoted_tensors", stats)
+        self.assertIn("hotset_promotion_strategy", stats)
+        self.assertIsNone(mx.last_mmap_load_stats(clear=True))
+
+    @unittest.skipUnless(
+        hasattr(mx, "last_mmap_load_stats"), "requires rebuilt mlx.core"
+    )
+    def test_last_mmap_load_stats_cleared_by_non_mmap_load(self):
+        safetensors_file = os.path.join(
+            self.test_dir, "test_last_mmap_stats_clear.safetensors"
+        )
+        npy_file = os.path.join(self.test_dir, "test_last_mmap_stats_clear.npy")
+        mx.save_safetensors(
+            safetensors_file,
+            {"weights": mx.arange(8, dtype=mx.float16).reshape(2, 4)},
+        )
+        mx.save(npy_file, mx.arange(6, dtype=mx.float32))
+
+        mx.last_mmap_load_stats(clear=True)
+        mx.load(safetensors_file, memory_map=True)
+        self.assertIsNotNone(mx.last_mmap_load_stats(clear=False))
+
+        mx.load(npy_file)
+        self.assertIsNone(mx.last_mmap_load_stats(clear=True))
+
+    @unittest.skipUnless(
+        hasattr(mx, "last_load_phase_stats"), "requires rebuilt mlx.core"
+    )
+    def test_last_load_phase_stats_safetensors_memory_map(self):
+        test_file = os.path.join(self.test_dir, "test_last_phase_stats.safetensors")
+        expected = mx.arange(16, dtype=mx.float32).reshape(4, 4)
+        mx.save_safetensors(test_file, {"weights": expected})
+
+        self.assertIsNone(mx.last_load_phase_stats(clear=True))
+
+        loaded = mx.load(test_file, memory_map=True)
+        stats = mx.last_load_phase_stats(clear=True)
+
+        self.assertTrue(mx.array_equal(loaded["weights"], expected))
+        self.assertIsNotNone(stats)
+        self.assertEqual(stats["tag"], "safetensors")
+        self.assertTrue(stats["memory_map"])
+        self.assertIn("open_map_seconds", stats)
+        self.assertIn("parse_seconds", stats)
+        self.assertIn("tensor_setup_seconds", stats)
+        self.assertGreaterEqual(stats["open_map_seconds"], 0.0)
+        self.assertGreaterEqual(stats["parse_seconds"], 0.0)
+        self.assertGreaterEqual(stats["tensor_setup_seconds"], 0.0)
+        self.assertIn("parse_minor_faults", stats)
+        self.assertIn("tensor_setup_major_faults", stats)
+        self.assertIsNone(mx.last_load_phase_stats(clear=True))
+
+    @unittest.skipUnless(
+        hasattr(mx, "last_load_phase_stats"), "requires rebuilt mlx.core"
+    )
+    def test_last_load_phase_stats_cleared_by_non_mmap_load(self):
+        safetensors_file = os.path.join(
+            self.test_dir, "test_last_phase_stats_clear.safetensors"
+        )
+        npy_file = os.path.join(self.test_dir, "test_last_phase_stats_clear.npy")
+        mx.save_safetensors(
+            safetensors_file,
+            {"weights": mx.arange(4, dtype=mx.float16).reshape(2, 2)},
+        )
+        mx.save(npy_file, mx.arange(6, dtype=mx.float32))
+
+        mx.last_load_phase_stats(clear=True)
+        mx.load(safetensors_file, memory_map=True)
+        self.assertIsNotNone(mx.last_load_phase_stats(clear=False))
+
+        mx.load(npy_file)
+        stats = mx.last_load_phase_stats(clear=True)
+        self.assertIsNotNone(stats)
+        self.assertEqual(stats["tag"], "npy")
+        self.assertFalse(stats["memory_map"])
+        self.assertIsNone(mx.last_load_phase_stats(clear=True))
+
     @unittest.skipIf(platform.system() == "Windows", "GGUF is disabled on Windows")
     def test_save_and_load_gguf(self):
         if not os.path.isdir(self.test_dir):
@@ -229,6 +393,38 @@ class TestLoad(mlx_tests.MLXTestCase):
         self.assertEqual(mapped.keys(), default.keys())
         for key in default.keys():
             self.assertTrue(mx.array_equal(mapped[key], default[key]))
+
+    @unittest.skipIf(platform.system() == "Windows", "GGUF is disabled on Windows")
+    def test_load_quantized_gguf_memory_map_parity(self):
+        test_file = os.path.join(self.test_dir, "test_memory_map_quantized_q4_0.gguf")
+        self._write_quantized_q4_0_gguf_fixture(test_file)
+
+        mapped = mx.load(test_file, format="gguf", memory_map=True)
+        default = mx.load(test_file, format="gguf")
+
+        self.assertEqual(set(mapped.keys()), set(default.keys()))
+        self.assertEqual(
+            set(mapped.keys()),
+            {"quant.weight", "quant.scales", "quant.biases"},
+        )
+        for key in default.keys():
+            self.assertTrue(mx.array_equal(mapped[key], default[key]))
+
+    @unittest.skipIf(platform.system() == "Windows", "GGUF is disabled on Windows")
+    @unittest.skipUnless(
+        hasattr(mx, "last_mmap_load_stats"), "requires rebuilt mlx.core"
+    )
+    def test_last_mmap_load_stats_quantized_gguf_reason(self):
+        test_file = os.path.join(self.test_dir, "test_last_mmap_stats_quantized.gguf")
+        self._write_quantized_q4_0_gguf_fixture(test_file)
+
+        mx.last_mmap_load_stats(clear=True)
+        loaded = mx.load(test_file, format="gguf", memory_map=True)
+        stats = mx.last_mmap_load_stats(clear=True)
+
+        self.assertTrue("quant.weight" in loaded)
+        self.assertIsNotNone(stats)
+        self.assertEqual(stats["fallback_reasons"].get("quantized_conversion"), 1)
 
     @unittest.skipIf(platform.system() == "Windows", "GGUF is disabled on Windows")
     def test_load_gguf_nvfp4_compat_flag(self):
