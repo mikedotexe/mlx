@@ -1,0 +1,135 @@
+[
+  {
+    "id": "arithmetic_digits",
+    "title": "Arithmetic digits only",
+    "tags": ["general"],
+    "prompt": "What is 17 + 28? Answer with digits only.",
+    "max_tokens": 4,
+    "expect": {
+      "equals": "45"
+    }
+  },
+  {
+    "id": "sorting_csv",
+    "title": "Sorting as CSV",
+    "tags": ["general"],
+    "prompt": "Sort these numbers ascending and answer as digits separated by commas only: 9, 2, 5",
+    "max_tokens": 8,
+    "expect": {
+      "matches_regex": "^2,\\s*5,\\s*9$"
+    }
+  },
+  {
+    "id": "yes_no_only",
+    "title": "Yes or no only",
+    "tags": ["general"],
+    "prompt": "Answer YES or NO only: Is water wet?",
+    "max_tokens": 4,
+    "expect": {
+      "matches_regex": "^(YES|NO)$"
+    }
+  },
+  {
+    "id": "five_word_description",
+    "title": "Exactly five words",
+    "tags": ["general"],
+    "prompt": "Describe a sunset in exactly five words.",
+    "max_tokens": 12,
+    "expect": {
+      "word_count": 5
+    }
+  },
+  {
+    "id": "three_bullets",
+    "title": "Three short bullets",
+    "tags": ["general"],
+    "prompt": "Give exactly three bullet points about apples. Keep each bullet under six words.",
+    "max_tokens": 32,
+    "expect": {
+      "bullet_count": 3,
+      "max_words_per_bullet": 6
+    }
+  },
+  {
+    "id": "esn_one_sentence",
+    "title": "ESN in one sentence",
+    "tags": ["esn"],
+    "prompt": "In one sentence under 24 words, what is an echo state network?",
+    "max_tokens": 24,
+    "expect": {
+      "contains_any": [
+        "reservoir",
+        "recurrent",
+        "network"
+      ],
+      "max_words": 24
+    }
+  },
+  {
+    "id": "json_only",
+    "title": "JSON obedience",
+    "tags": ["general"],
+    "prompt": "Reply with JSON only: {\"animal\":\"cat\",\"sound\":\"meow\"}",
+    "max_tokens": 24,
+    "expect": {
+      "json_equals": {
+        "animal": "cat",
+        "sound": "meow"
+      }
+    }
+  },
+  {
+    "id": "prime_even_exception",
+    "title": "Only even prime",
+    "tags": ["primes"],
+    "prompt": "In one sentence under 12 words, what is the only even prime?",
+    "max_tokens": 16,
+    "expect": {
+      "contains_any": ["2", "two"],
+      "max_words": 12
+    }
+  },
+  {
+    "id": "twin_primes_status",
+    "title": "Twin prime status",
+    "tags": ["primes"],
+    "prompt": "Answer in one sentence under 16 words: Are infinitely many twin primes proven?",
+    "max_tokens": 20,
+    "expect": {
+      "contains_any": ["open", "unproven", "not proven", "unknown"],
+      "max_words": 16
+    }
+  },
+  {
+    "id": "prime_factorization_84",
+    "title": "Prime factorization",
+    "tags": ["primes"],
+    "prompt": "Prime factorize 84. Answer with digits and multiplication symbols only.",
+    "max_tokens": 12,
+    "expect": {
+      "matches_regex": "^(2\\s*[x*×]\\s*2\\s*[x*×]\\s*3\\s*[x*×]\\s*7|2\\^2\\s*[x*×]\\s*3\\s*[x*×]\\s*7)$"
+    }
+  },
+  {
+    "id": "esn_reservoir_role",
+    "title": "ESN reservoir role",
+    "tags": ["esn"],
+    "prompt": "In one sentence under 24 words, what role does the reservoir play in an echo state network?",
+    "max_tokens": 24,
+    "expect": {
+      "contains_any": ["state", "dynamic", "recurrent", "memory"],
+      "max_words": 24
+    }
+  },
+  {
+    "id": "esn_leak_rate",
+    "title": "ESN leak-rate meaning",
+    "tags": ["esn"],
+    "prompt": "In one sentence under 24 words, what does leak rate control in a leaky echo state network?",
+    "max_tokens": 24,
+    "expect": {
+      "contains_any": ["timescale", "memory", "update", "state"],
+      "max_words": 24
+    }
+  }
+]
