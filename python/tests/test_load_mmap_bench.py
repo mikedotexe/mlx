@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import shlex
 import sys
 import tempfile
 import unittest
@@ -22,6 +23,8 @@ def _demo_args(**overrides):
         "mmap_hotset_promotion_top_k": None,
         "mmap_hotset_promotion_min_bytes": None,
         "policy_mode": "manual",
+        "subprocess_python_executable": None,
+        "subprocess_pythonpath": None,
         "history_json": str(bench._demo_fixture_history_path()),
         "min_pass": None,
         "max_invalid_attempts": None,
@@ -195,6 +198,60 @@ class TestLoadMmapBench(unittest.TestCase):
             ),
             "hybrid:small_tensor_copy_lte=65536B",
         )
+
+    def test_effective_subprocess_pythonpath_inherits_for_parent_interpreter(self):
+        inherited = bench._effective_subprocess_pythonpath(
+            subprocess_python_executable=bench._resolve_subprocess_python_executable(
+                None
+            ),
+            requested_pythonpath=None,
+            base_env={"PYTHONPATH": "/tmp/repo/python"},
+        )
+
+        self.assertEqual(inherited, "/tmp/repo/python")
+
+    def test_effective_subprocess_pythonpath_clears_for_different_interpreter(self):
+        cleared = bench._effective_subprocess_pythonpath(
+            subprocess_python_executable="/tmp/alt-python",
+            requested_pythonpath=None,
+            base_env={"PYTHONPATH": "/tmp/repo/python"},
+        )
+
+        self.assertIsNone(cleared)
+
+    def test_build_subprocess_env_honors_explicit_pythonpath(self):
+        env = bench._build_subprocess_env(
+            subprocess_python_executable="/tmp/alt-python",
+            requested_pythonpath="/tmp/fast/python",
+            debug_io=True,
+            collect_mmap_stats=False,
+            base_env={"PYTHONPATH": "/tmp/repo/python", "HOME": "/tmp/home"},
+        )
+
+        self.assertEqual(env["PYTHONPATH"], "/tmp/fast/python")
+        self.assertEqual(env["MLX_DEBUG_IO_MEMORY_MAP"], "1")
+        self.assertEqual(env["HOME"], "/tmp/home")
+
+    def test_build_experiment_command_includes_subprocess_runtime_flags(self):
+        args = _demo_args(
+            subprocess_python_executable="/tmp/fast-python",
+            subprocess_pythonpath="/tmp/fast/python",
+        )
+
+        command = bench._build_experiment_command(
+            script_path="/tmp/load_mmap_bench.py",
+            file_path="/tmp/model.safetensors",
+            fmt="safetensors",
+            cache_mode="warm",
+            args=args,
+            prefer_synth_decode=True,
+        )
+        parts = shlex.split(command)
+
+        self.assertIn("--subprocess-python-executable", parts)
+        self.assertIn("/tmp/fast-python", parts)
+        self.assertIn("--subprocess-pythonpath", parts)
+        self.assertIn("/tmp/fast/python", parts)
 
     def test_compact_policy_matrix_cases(self):
         cases, cache_modes = bench._compact_policy_matrix_cases(
@@ -783,7 +840,7 @@ class TestLoadMmapBench(unittest.TestCase):
                 "evidence",
             },
         )
-        self.assertEqual(len(summary["scorecard"]["external_corpus_cases"]), 3)
+        self.assertEqual(len(summary["scorecard"]["external_corpus_cases"]), 7)
 
     def test_build_prime_physics_corpus_fixture_summary_prefers_scoped_routes(self):
         summary = bench._build_prime_physics_corpus_fixture_summary()
@@ -800,6 +857,34 @@ class TestLoadMmapBench(unittest.TestCase):
         self.assertEqual(
             cases["formalization_scope_guardrail"]["chosen_route_id"], "stability_audit"
         )
+
+    def test_build_echo_state_networks_corpus_fixture_summary_prefers_input_aware_and_replication_routes(self):
+        summary = bench._build_echo_state_networks_corpus_fixture_summary()
+        cases = {case["case_id"]: case for case in summary["cases"]}
+
+        self.assertEqual(summary["pass_count"], 4)
+        self.assertEqual(summary["match_rate"], 1.0)
+        self.assertEqual(
+            cases["input_linked_stability"]["chosen_route_id"], "stability_audit"
+        )
+        self.assertEqual(
+            cases["leak_tuning_matters"]["chosen_route_id"], "stability_audit"
+        )
+        self.assertEqual(cases["benchmark_scope"]["chosen_route_id"], "broaden_the_matrix")
+        self.assertEqual(
+            cases["edge_of_stability_replication"]["chosen_route_id"],
+            "broaden_the_matrix",
+        )
+
+    def test_build_esn_collaboration_demo_summary_focuses_on_esn_cases(self):
+        summary = bench._build_esn_collaboration_demo_summary(_demo_args())
+
+        self.assertEqual(summary["demo_preset"], "esn-collaboration")
+        self.assertEqual(summary["history_source"], "fixture")
+        self.assertEqual(summary["verdict"]["status"], "pass")
+        self.assertEqual(summary["scorecard"]["pass_count"], 4)
+        self.assertEqual(summary["scorecard"]["total_cases"], 4)
+        self.assertEqual(len(summary["evidence"]["recommended_probes"]), 3)
 
     def test_build_regression_forensics_demo_summary_surfaces_expected_labels(self):
         summary = bench._build_regression_forensics_demo_summary(_demo_args())
@@ -818,7 +903,7 @@ class TestLoadMmapBench(unittest.TestCase):
             cases["first_token_regression"]["loss_metrics"],
         )
         self.assertEqual(cases["mixed_tradeoff"]["outcome"], "mixed")
-        self.assertEqual(len(summary["scorecard"]["external_corpus_cases"]), 3)
+        self.assertEqual(len(summary["scorecard"]["external_corpus_cases"]), 7)
 
     def test_build_persistence_memory_demo_summary_shows_scope_guardrail(self):
         summary = bench._build_persistence_memory_demo_summary(_demo_args())

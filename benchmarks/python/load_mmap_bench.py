@@ -14,6 +14,7 @@ import platform
 import re
 import resource
 import shlex
+import shutil
 import socket
 import statistics
 import struct
@@ -61,6 +62,7 @@ _DEMO_PRESET_CHOICES = (
     "golden-guardrail",
     "regression-forensics",
     "persistence-memory",
+    "esn-collaboration",
 )
 _COMPARISON_METRIC_SPECS = (
     {
@@ -656,6 +658,148 @@ def _extract_code_state(environment_metadata: dict | None) -> dict:
         "git_branch": environment_metadata.get("git_branch"),
         "git_dirty": environment_metadata.get("git_dirty"),
     }
+
+
+def _resolve_subprocess_python_executable(executable: str | None) -> str:
+    if executable is None:
+        return os.path.abspath(sys.executable)
+    candidate = executable.strip()
+    if not candidate:
+        raise ValueError("--subprocess-python-executable must not be empty")
+    expanded = os.path.expanduser(candidate)
+    if os.path.isabs(expanded) or os.path.sep in expanded or (
+        os.path.altsep and os.path.altsep in expanded
+    ):
+        resolved = os.path.abspath(expanded)
+        if not os.path.exists(resolved):
+            raise ValueError(
+                f"--subprocess-python-executable does not exist: {executable}"
+            )
+        return resolved
+    resolved = shutil.which(expanded)
+    if resolved is None:
+        raise ValueError(
+            f"--subprocess-python-executable was not found on PATH: {executable}"
+        )
+    return os.path.abspath(resolved)
+
+
+def _same_python_executable(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    return os.path.abspath(left) == os.path.abspath(right)
+
+
+def _effective_subprocess_pythonpath(
+    *,
+    subprocess_python_executable: str,
+    requested_pythonpath: str | None,
+    base_env: dict[str, str] | None = None,
+) -> str | None:
+    if requested_pythonpath is not None:
+        normalized = requested_pythonpath.strip()
+        return normalized or None
+    if _same_python_executable(subprocess_python_executable, sys.executable):
+        current = (base_env or os.environ).get("PYTHONPATH")
+        return current or None
+    return None
+
+
+def _build_subprocess_env(
+    *,
+    subprocess_python_executable: str,
+    requested_pythonpath: str | None,
+    debug_io: bool,
+    collect_mmap_stats: bool,
+    base_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    env = dict(base_env or os.environ)
+    effective_pythonpath = _effective_subprocess_pythonpath(
+        subprocess_python_executable=subprocess_python_executable,
+        requested_pythonpath=requested_pythonpath,
+        base_env=env,
+    )
+    if effective_pythonpath is None:
+        if requested_pythonpath is not None or not _same_python_executable(
+            subprocess_python_executable, sys.executable
+        ):
+            env.pop("PYTHONPATH", None)
+    else:
+        env["PYTHONPATH"] = effective_pythonpath
+    if debug_io or collect_mmap_stats:
+        env["MLX_DEBUG_IO_MEMORY_MAP"] = "1"
+    return env
+
+
+def _probe_subprocess_runtime_capabilities(
+    *,
+    subprocess_python_executable: str,
+    requested_pythonpath: str | None,
+) -> dict:
+    env = _build_subprocess_env(
+        subprocess_python_executable=subprocess_python_executable,
+        requested_pythonpath=requested_pythonpath,
+        debug_io=False,
+        collect_mmap_stats=False,
+    )
+    probe = """
+import json
+
+result = {}
+try:
+    import mlx.core as mx
+    result["import_ok"] = True
+    result["has_last_mmap_load_stats"] = hasattr(mx, "last_mmap_load_stats")
+    result["has_last_load_phase_stats"] = hasattr(mx, "last_load_phase_stats")
+    try:
+        mx.load(
+            "/__codex_missing_probe__.safetensors",
+            format="safetensors",
+            memory_map=False,
+            return_metadata=True,
+            gguf_nvfp4_compat=False,
+            mmap_small_tensor_copy_max_bytes=None,
+            mmap_hotset_promotion_top_k=None,
+            mmap_hotset_promotion_min_bytes=None,
+            mmap_prefetch_strategy="sequential",
+        )
+    except TypeError as exc:
+        result["extended_load_args_ok"] = False
+        result["load_probe_error"] = str(exc)
+    except Exception as exc:
+        result["extended_load_args_ok"] = True
+        result["load_probe_error"] = f"{type(exc).__name__}: {exc}"
+except Exception as exc:
+    result["import_ok"] = False
+    result["error"] = f"{type(exc).__name__}: {exc}"
+
+print(json.dumps(result))
+"""
+    completed = subprocess.run(
+        [subprocess_python_executable, "-c", probe],
+        text=True,
+        env=env,
+        capture_output=True,
+        check=False,
+    )
+    payload = (completed.stdout or "").strip().splitlines()
+    if not payload:
+        raise RuntimeError(
+            "subprocess runtime probe did not produce JSON output:\n"
+            f"cmd={subprocess_python_executable} -c <probe>\n"
+            f"stderr:\n{completed.stderr}"
+        )
+    try:
+        result = json.loads(payload[-1])
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "subprocess runtime probe emitted invalid JSON:\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        ) from exc
+    result["returncode"] = completed.returncode
+    result["stderr"] = completed.stderr.strip() or None
+    return result
 
 
 def _make_run_id(
@@ -1598,7 +1742,19 @@ def _infer_model_metadata(
     }
 
 
-def _collect_environment_metadata(repo_root: Path) -> dict:
+def _collect_environment_metadata(
+    repo_root: Path,
+    *,
+    subprocess_python_executable: str | None = None,
+    subprocess_pythonpath: str | None = None,
+) -> dict:
+    resolved_subprocess_python_executable = _resolve_subprocess_python_executable(
+        subprocess_python_executable
+    )
+    effective_subprocess_pythonpath = _effective_subprocess_pythonpath(
+        subprocess_python_executable=resolved_subprocess_python_executable,
+        requested_pythonpath=subprocess_pythonpath,
+    )
     git_head = _safe_check_output(["git", "-C", str(repo_root), "rev-parse", "HEAD"])
     git_head_short = _safe_check_output(
         ["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"]
@@ -1637,6 +1793,11 @@ def _collect_environment_metadata(repo_root: Path) -> dict:
         "processor": platform.processor() or None,
         "python_version": platform.python_version(),
         "python_executable": sys.executable,
+        "subprocess_python_executable": resolved_subprocess_python_executable,
+        "subprocess_pythonpath": effective_subprocess_pythonpath,
+        "subprocess_python_matches_parent": _same_python_executable(
+            resolved_subprocess_python_executable, sys.executable
+        ),
         "cwd": str(Path.cwd()),
         "git_head": git_head,
         "git_head_short": git_head_short,
@@ -3308,6 +3469,15 @@ def _build_experiment_command(
     ]
     if requested_policy_mode != "manual":
         parts.extend(["--policy-mode", requested_policy_mode])
+    if args.subprocess_python_executable is not None:
+        parts.extend(
+            [
+                "--subprocess-python-executable",
+                args.subprocess_python_executable,
+            ]
+        )
+    if args.subprocess_pythonpath is not None:
+        parts.extend(["--subprocess-pythonpath", args.subprocess_pythonpath])
     default_history_json = str(Path(script_path).with_name("load_mmap_history.jsonl"))
     resolved_history_json = (
         str(history_json_path) if history_json_path is not None else str(args.history_json)
@@ -3540,6 +3710,14 @@ def _prime_physics_demo_fixture_history_path() -> Path:
     )
 
 
+def _echo_state_networks_demo_fixture_history_path() -> Path:
+    return (
+        Path(__file__).resolve().parent
+        / "testdata"
+        / "load_mmap_echo_state_networks_demo_history.jsonl"
+    )
+
+
 def _demo_session_id(preset: str) -> str:
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{_slugify_identifier(preset)}-{stamp}-{os.getpid()}"
@@ -3626,6 +3804,8 @@ def _demo_summary_base(
 def _build_prime_physics_corpus_cases() -> list[dict]:
     return [
         {
+            "corpus": "prime_physics",
+            "corpus_label": "Prime Physics",
             "case_id": "negative_results_persist",
             "title": "Negative Results Must Persist",
             "claim": (
@@ -3650,6 +3830,8 @@ def _build_prime_physics_corpus_cases() -> list[dict]:
             "refuted_route_id": "coverage_targeted_fallback_work",
         },
         {
+            "corpus": "prime_physics",
+            "corpus_label": "Prime Physics",
             "case_id": "single_instance_scope",
             "title": "Single-Instance Asymmetry Stays Narrow",
             "claim": (
@@ -3668,6 +3850,8 @@ def _build_prime_physics_corpus_cases() -> list[dict]:
             "refuted_route_id": "coverage_targeted_fallback_work",
         },
         {
+            "corpus": "prime_physics",
+            "corpus_label": "Prime Physics",
             "case_id": "formalization_scope_guardrail",
             "title": "Formalization Increases Trust, Not Claim Size",
             "claim": (
@@ -3708,7 +3892,7 @@ def _sorted_route_outcome_stats(route_stats: list[dict] | dict[str, dict]) -> li
     )
 
 
-def _summarize_prime_physics_corpus_case(case: dict, records: list[dict]) -> dict:
+def _summarize_external_corpus_case(case: dict, records: list[dict]) -> dict:
     bucket_records = [
         record
         for record in records
@@ -3736,6 +3920,8 @@ def _summarize_prime_physics_corpus_case(case: dict, records: list[dict]) -> dic
         else None
     )
     return {
+        "corpus": case.get("corpus"),
+        "corpus_label": case.get("corpus_label"),
         "case_id": case["case_id"],
         "title": case["title"],
         "claim": case["claim"],
@@ -3769,21 +3955,215 @@ def _summarize_prime_physics_corpus_case(case: dict, records: list[dict]) -> dic
     }
 
 
+def _build_external_corpus_fixture_summary(
+    *,
+    fixture_path: Path,
+    cases: list[dict],
+    corpus: str,
+    corpus_label: str,
+) -> dict:
+    records = _load_history_jsonl(fixture_path)
+    summarized_cases = [
+        _summarize_external_corpus_case(case, records)
+        for case in cases
+    ]
+    passed = sum(1 for case in summarized_cases if case["verdict"] == "pass")
+    return {
+        "corpus": corpus,
+        "corpus_label": corpus_label,
+        "fixture_path": str(fixture_path),
+        "cases": summarized_cases,
+        "pass_count": passed,
+        "total_cases": len(summarized_cases),
+        "match_rate": round(passed / len(summarized_cases), 3)
+        if summarized_cases
+        else 0.0,
+    }
+
+
 def _build_prime_physics_corpus_fixture_summary() -> dict:
     fixture_path = _prime_physics_demo_fixture_history_path()
-    records = _load_history_jsonl(fixture_path)
-    cases = [
-        _summarize_prime_physics_corpus_case(case, records)
-        for case in _build_prime_physics_corpus_cases()
+    return _build_external_corpus_fixture_summary(
+        fixture_path=fixture_path,
+        cases=_build_prime_physics_corpus_cases(),
+        corpus="prime_physics",
+        corpus_label="Prime Physics",
+    )
+
+
+def _build_echo_state_networks_corpus_cases() -> list[dict]:
+    return [
+        {
+            "corpus": "echo_state_networks",
+            "corpus_label": "Echo State Networks",
+            "case_id": "input_linked_stability",
+            "title": "Input-Aware Stability Beats Scalar Folklore",
+            "claim": (
+                "Practical ESN stability should be treated as input-conditioned "
+                "rather than reduced to a one-number reservoir folklore rule."
+            ),
+            "history_bucket_key": "esn_input_linked_stability",
+            "expected_route_id": "stability_audit",
+            "loop_noticed": (
+                "The loop asks for an input-aware stability audit before "
+                "trusting scalar folklore about the echo state property."
+            ),
+            "scope_note": (
+                "Corrective theory should outrank oversimplified field folklore."
+            ),
+            "refuted_stories": [
+                "spectral radius alone settles practical ESN stability",
+                "one scalar ESP recipe is enough for all tasks",
+            ],
+        },
+        {
+            "corpus": "echo_state_networks",
+            "corpus_label": "Echo State Networks",
+            "case_id": "leak_tuning_matters",
+            "title": "Leak Tuning Is Part Of The Real Model Story",
+            "claim": (
+                "Leaking rate, spectral radius, and scaling choices are part of "
+                "how ESNs really work in practice, not an embarrassing detail "
+                "outside the main story."
+            ),
+            "history_bucket_key": "esn_leak_tuning_matters",
+            "expected_route_id": "stability_audit",
+            "loop_noticed": (
+                "The loop keeps task-timescale tuning in the core engineering "
+                "story and asks for a stability audit instead of handwaving it away."
+            ),
+            "scope_note": (
+                "Practical tuning should be treated as model substance, not as an apology."
+            ),
+            "refuted_stories": [
+                "ESNs are just random reservoirs plus a readout",
+                "leak tuning is an embarrassing implementation detail",
+            ],
+        },
+        {
+            "corpus": "echo_state_networks",
+            "corpus_label": "Echo State Networks",
+            "case_id": "benchmark_scope",
+            "title": "Benchmark Wins Stay Task-Scoped",
+            "claim": (
+                "Strong early chaotic-prediction and communication wins matter, "
+                "but they should stay task-scoped until a broader matrix is built."
+            ),
+            "history_bucket_key": "esn_benchmark_scope",
+            "expected_route_id": "broaden_the_matrix",
+            "loop_noticed": (
+                "The loop keeps flagship benchmark wins local and asks for a "
+                "broader task ladder before turning them into a general verdict."
+            ),
+            "scope_note": (
+                "Founding benchmark wins should expand the matrix, not settle the field."
+            ),
+            "refuted_stories": [
+                "one headline benchmark proves ESNs broadly superior",
+            ],
+        },
+        {
+            "corpus": "echo_state_networks",
+            "corpus_label": "Echo State Networks",
+            "case_id": "edge_of_stability_replication",
+            "title": "Edge-of-Stability Is Promising, Not Settled",
+            "claim": (
+                "ES2N looks like a serious architectural advance, but its "
+                "strongest memory and performance claims should stay in a "
+                "replication bucket for now."
+            ),
+            "history_bucket_key": "esn_edge_of_stability_replication",
+            "expected_route_id": "broaden_the_matrix",
+            "loop_noticed": (
+                "The loop keeps the edge-of-stability result in a promising "
+                "replication bucket and asks for broader task coverage."
+            ),
+            "scope_note": (
+                "Promising architectural work should be remembered, but not promoted too fast."
+            ),
+            "refuted_stories": [
+                "one modern architecture paper settles the stability-memory tradeoff",
+            ],
+        },
     ]
-    passed = sum(1 for case in cases if case["verdict"] == "pass")
-    return {
-        "fixture_path": str(fixture_path),
-        "cases": cases,
-        "pass_count": passed,
-        "total_cases": len(cases),
-        "match_rate": round(passed / len(cases), 3) if cases else 0.0,
+
+
+def _build_echo_state_networks_corpus_fixture_summary() -> dict:
+    fixture_path = _echo_state_networks_demo_fixture_history_path()
+    return _build_external_corpus_fixture_summary(
+        fixture_path=fixture_path,
+        cases=_build_echo_state_networks_corpus_cases(),
+        corpus="echo_state_networks",
+        corpus_label="Echo State Networks",
+    )
+
+
+def _echo_state_networks_recommended_probes() -> list[str]:
+    return [
+        "Build a task ladder covering short-memory, long-memory, nonlinear, and slow noisy regimes.",
+        "Rerun stability reasoning under explicitly different input regimes instead of a single folklore scalar.",
+        "Replicate edge-of-stability results across multiple task families, reservoir sizes, and baseline reservoirs.",
+    ]
+
+
+def _build_esn_collaboration_demo_summary(args: argparse.Namespace) -> dict:
+    del args
+    esn = _build_echo_state_networks_corpus_fixture_summary()
+    summary = _demo_summary_base(
+        demo_preset="esn-collaboration",
+        history_source="fixture",
+        targets=[
+            {"case_id": case["case_id"], "title": case["title"]}
+            for case in esn["cases"]
+        ],
+        steps=[
+            {
+                "name": "load_esn_fixture_history",
+                "status": "ok",
+                "fixture": esn["fixture_path"],
+            },
+            {
+                "name": "summarize_esn_claim_memory",
+                "status": "ok",
+                "case_count": esn["total_cases"],
+            },
+        ],
+    )
+    verdict_ok = (
+        esn["pass_count"] == esn["total_cases"] if esn["total_cases"] > 0 else True
+    )
+    summary["verdict"] = {
+        "status": "pass" if verdict_ok else "fail",
+        "summary": (
+            "ESN collaborator replay keeps efficiency wins, tuning nuance, "
+            "input-aware stability, and replication discipline in view."
+        ),
     }
+    summary["scorecard"] = {
+        "case_match_rate": esn["match_rate"],
+        "pass_count": esn["pass_count"],
+        "total_cases": esn["total_cases"],
+        "cases": esn["cases"],
+    }
+    summary["evidence"] = {
+        "fixture_path": esn["fixture_path"],
+        "recommended_probes": _echo_state_networks_recommended_probes(),
+        "artifacts": {
+            "hypotheses": str(
+                Path(__file__).resolve().parent
+                / "load_mmap_echo_state_networks_hypotheses.md"
+            ),
+            "report": str(
+                Path(__file__).resolve().parent
+                / "load_mmap_echo_state_networks_ingest_report.md"
+            ),
+            "memo": str(
+                Path(__file__).resolve().parent
+                / "load_mmap_echo_state_networks_collaborator_memo.md"
+            ),
+        },
+    }
+    return summary
 
 
 def _prime_physics_foreign_pressure_records() -> list[dict]:
@@ -4495,6 +4875,18 @@ def _build_history_replay_demo_summary(args: argparse.Namespace) -> dict:
     records = _load_history_jsonl(fixture_path)
     report = _build_history_report(records, top_n=args.report_top)
     prime_physics = _build_prime_physics_corpus_fixture_summary()
+    echo_state_networks = _build_echo_state_networks_corpus_fixture_summary()
+    external_corpus_groups = [prime_physics, echo_state_networks]
+    external_corpus_cases = [
+        case for group in external_corpus_groups for case in group["cases"]
+    ]
+    external_corpus_pass_count = sum(group["pass_count"] for group in external_corpus_groups)
+    external_corpus_total_cases = sum(group["total_cases"] for group in external_corpus_groups)
+    external_corpus_match_rate = (
+        round(external_corpus_pass_count / external_corpus_total_cases, 3)
+        if external_corpus_total_cases
+        else 0.0
+    )
     replay_payload = {
         "file": "/demo/replay_quantized.gguf",
         "format": "gguf",
@@ -4589,9 +4981,12 @@ def _build_history_replay_demo_summary(args: argparse.Namespace) -> dict:
         else False
     )
     corpus_ok = (
-        prime_physics["pass_count"] == prime_physics["total_cases"]
-        if prime_physics["total_cases"] > 0
-        else True
+        all(
+            group["pass_count"] == group["total_cases"]
+            if group["total_cases"] > 0
+            else True
+            for group in external_corpus_groups
+        )
     )
     summary["verdict"] = {
         "status": (
@@ -4625,12 +5020,24 @@ def _build_history_replay_demo_summary(args: argparse.Namespace) -> dict:
                 else None
             ),
         },
-        "external_corpus_match_rate": prime_physics["match_rate"],
-        "external_corpus_cases": prime_physics["cases"],
+        "external_corpus_match_rate": external_corpus_match_rate,
+        "external_corpus_cases": external_corpus_cases,
+        "external_corpus_groups": [
+            {
+                "corpus": group["corpus"],
+                "corpus_label": group["corpus_label"],
+                "match_rate": group["match_rate"],
+                "pass_count": group["pass_count"],
+                "total_cases": group["total_cases"],
+            }
+            for group in external_corpus_groups
+        ],
     }
     summary["evidence"] = {
         "fixture_path": str(fixture_path),
-        "external_corpus_fixture_path": prime_physics["fixture_path"],
+        "external_corpus_fixture_paths": {
+            group["corpus"]: group["fixture_path"] for group in external_corpus_groups
+        },
         "top_bucket": {
             "bucket_key": top_bucket.get("bucket_key"),
             "policy_winners": top_bucket.get("policy_winners"),
@@ -4746,6 +5153,11 @@ def _build_regression_forensics_demo_summary(args: argparse.Namespace) -> dict:
     fixture_path = _demo_fixture_history_path()
     records = _load_history_jsonl(fixture_path)
     prime_physics = _build_prime_physics_corpus_fixture_summary()
+    echo_state_networks = _build_echo_state_networks_corpus_fixture_summary()
+    external_corpus_groups = [prime_physics, echo_state_networks]
+    external_corpus_cases = [
+        case for group in external_corpus_groups for case in group["cases"]
+    ]
     cases = []
     for case in _build_regression_forensics_cases():
         analysis = _analyze_demo_case(
@@ -4806,9 +5218,12 @@ def _build_regression_forensics_demo_summary(args: argparse.Namespace) -> dict:
     )
     suggestions_ok = all(case["top_suggestion"] is not None for case in cases)
     corpus_ok = (
-        prime_physics["pass_count"] == prime_physics["total_cases"]
-        if prime_physics["total_cases"] > 0
-        else True
+        all(
+            group["pass_count"] == group["total_cases"]
+            if group["total_cases"] > 0
+            else True
+            for group in external_corpus_groups
+        )
     )
     summary["verdict"] = {
         "status": (
@@ -4829,11 +5244,23 @@ def _build_regression_forensics_demo_summary(args: argparse.Namespace) -> dict:
                 else None
             ),
         },
-        "external_corpus_cases": prime_physics["cases"],
+        "external_corpus_cases": external_corpus_cases,
+        "external_corpus_groups": [
+            {
+                "corpus": group["corpus"],
+                "corpus_label": group["corpus_label"],
+                "match_rate": group["match_rate"],
+                "pass_count": group["pass_count"],
+                "total_cases": group["total_cases"],
+            }
+            for group in external_corpus_groups
+        ],
     }
     summary["evidence"] = {
         "fixture_path": str(fixture_path),
-        "external_corpus_fixture_path": prime_physics["fixture_path"],
+        "external_corpus_fixture_paths": {
+            group["corpus"]: group["fixture_path"] for group in external_corpus_groups
+        },
         "top_suggestions": [
             {
                 "case_id": case["case_id"],
@@ -5013,8 +5440,13 @@ def _print_demo_summary_text(summary: dict) -> None:
         if external_cases:
             print("  external corpus replay:")
             for case in external_cases:
+                prefix = (
+                    f"[{case['corpus_label']}] "
+                    if case.get("corpus_label")
+                    else ""
+                )
                 print(
-                    f"    {case['title']}: {case['verdict']} "
+                    f"    {prefix}{case['title']}: {case['verdict']} "
                     f"chosen={case['chosen_route']} expected={case['expected_route']}"
                 )
     elif summary["demo_preset"] == "regression-forensics":
@@ -5033,7 +5465,12 @@ def _print_demo_summary_text(summary: dict) -> None:
         if external_cases:
             print("  external corpus cases:")
             for case in external_cases:
-                print(f"    {case['title']}: {case['loop_noticed']}")
+                prefix = (
+                    f"[{case['corpus_label']}] "
+                    if case.get("corpus_label")
+                    else ""
+                )
+                print(f"    {prefix}{case['title']}: {case['loop_noticed']}")
                 print(
                     f"      next route: {case['chosen_route']} "
                     f"({case['chosen_route_id']})"
@@ -5056,6 +5493,23 @@ def _print_demo_summary_text(summary: dict) -> None:
                     f"chosen={stage['chosen_route'] or 'none'} "
                     f"refuted={stage['refuted_route']}"
                 )
+    elif summary["demo_preset"] == "esn-collaboration":
+        print(
+            "  ESN case scorecard: "
+            f"{summary['scorecard'].get('pass_count', 0)}/"
+            f"{summary['scorecard'].get('total_cases', 0)}"
+        )
+        for case in summary["scorecard"].get("cases", []):
+            print(
+                f"  {case['title']}: {case['verdict']} "
+                f"chosen={case['chosen_route']} expected={case['expected_route']}"
+            )
+            print(f"    {case['loop_noticed']}")
+        probes = summary["evidence"].get("recommended_probes") or []
+        if probes:
+            print("  recommended probes:")
+            for probe in probes:
+                print(f"    - {probe}")
     elif summary["demo_preset"] == "golden-guardrail":
         for case in summary["scorecard"].get("cases", []):
             print(
@@ -5122,6 +5576,11 @@ def _run_demo_preset(
 
     if args.demo_preset == "persistence-memory":
         summary = _build_persistence_memory_demo_summary(args)
+        _emit_demo_summary(summary, output_format=args.demo_format)
+        return 0 if summary["verdict"].get("status") == "pass" else 1
+
+    if args.demo_preset == "esn-collaboration":
+        summary = _build_esn_collaboration_demo_summary(args)
         _emit_demo_summary(summary, output_format=args.demo_format)
         return 0 if summary["verdict"].get("status") == "pass" else 1
 
@@ -5376,11 +5835,13 @@ def _run_worker_subprocess(
     cache_mode: str,
     worker_prime_loads: int,
     collect_mmap_stats: bool,
+    subprocess_python_executable: str,
+    subprocess_pythonpath: str | None,
 ) -> dict:
     _prepare_file_cache(path, cache_mode)
 
     cmd = [
-        sys.executable,
+        subprocess_python_executable,
         script_path,
         "--worker",
         "--file",
@@ -5416,9 +5877,12 @@ def _run_worker_subprocess(
         cmd += ["--worker-decode-synth-max-elems", str(decode_synth_max_elems)]
         cmd += ["--worker-decode-synth-repeats", str(decode_synth_repeats)]
 
-    env = os.environ.copy()
-    if debug_io or collect_mmap_stats:
-        env["MLX_DEBUG_IO_MEMORY_MAP"] = "1"
+    env = _build_subprocess_env(
+        subprocess_python_executable=subprocess_python_executable,
+        requested_pythonpath=subprocess_pythonpath,
+        debug_io=debug_io,
+        collect_mmap_stats=collect_mmap_stats,
+    )
 
     completed = subprocess.run(
         cmd,
@@ -5465,8 +5929,13 @@ def _run_trials(
     cache_mode: str,
     worker_prime_loads: int,
     collect_mmap_stats: bool = False,
+    subprocess_python_executable: str | None = None,
+    subprocess_pythonpath: str | None = None,
 ) -> list[dict]:
     trials = []
+    resolved_subprocess_python_executable = _resolve_subprocess_python_executable(
+        subprocess_python_executable
+    )
     total_runs = max(warmup_runs, 0) + max(runs, 0)
     for run_idx in range(total_runs):
         trial = _run_worker_subprocess(
@@ -5486,6 +5955,8 @@ def _run_trials(
             cache_mode=cache_mode,
             worker_prime_loads=worker_prime_loads,
             collect_mmap_stats=collect_mmap_stats,
+            subprocess_python_executable=resolved_subprocess_python_executable,
+            subprocess_pythonpath=subprocess_pythonpath,
         )
         if run_idx >= max(warmup_runs, 0):
             trials.append(trial)
@@ -5510,6 +5981,8 @@ def _run_interleaved_trials(
     decode_synth_repeats: int,
     cache_mode: str,
     worker_prime_loads: int,
+    subprocess_python_executable: str | None = None,
+    subprocess_pythonpath: str | None = None,
 ) -> tuple[list[dict], list[dict]]:
     copy_trials: list[dict] = []
     mmap_trials: list[dict] = []
@@ -5543,6 +6016,8 @@ def _run_interleaved_trials(
                 decode_synth_repeats=decode_synth_repeats,
                 cache_mode=cache_mode,
                 worker_prime_loads=worker_prime_loads,
+                subprocess_python_executable=subprocess_python_executable,
+                subprocess_pythonpath=subprocess_pythonpath,
             )
             results[memory_map] = mode_trials[0]
 
@@ -5666,6 +6141,23 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--subprocess-python-executable",
+        default=None,
+        help=(
+            "Python executable used for benchmark child processes. "
+            "When this differs from the parent interpreter, child PYTHONPATH is "
+            "cleared by default unless --subprocess-pythonpath is set."
+        ),
+    )
+    parser.add_argument(
+        "--subprocess-pythonpath",
+        default=None,
+        help=(
+            "Explicit PYTHONPATH passed to benchmark child processes. "
+            "Default: inherit when reusing the parent interpreter, otherwise clear it."
+        ),
+    )
+    parser.add_argument(
         "--sweep-mmap-small-tensor-copy-max-bytes",
         default=None,
         help=(
@@ -5762,7 +6254,8 @@ def main() -> int:
             "adaptation-ladder=seed live buckets and test auto policy, "
             "golden-guardrail=wrap the correctness matrix with a demo summary, "
             "regression-forensics=replay curated regression investigations, "
-            "persistence-memory=show fresh/session/scoped-memory suppression."
+            "persistence-memory=show fresh/session/scoped-memory suppression, "
+            "esn-collaboration=ESN-specific collaborator replay."
         ),
     )
     parser.add_argument(
@@ -6267,6 +6760,10 @@ def main() -> int:
         )
     if args.report_top < 1:
         raise ValueError("--report-top must be >= 1")
+    if args.subprocess_python_executable is not None:
+        args.subprocess_python_executable = _resolve_subprocess_python_executable(
+            args.subprocess_python_executable
+        )
 
     if args.mmap_small_tensor_copy_max_bytes is not None:
         if args.mmap_small_tensor_copy_max_bytes < 0:
@@ -6524,7 +7021,11 @@ def main() -> int:
         if token.strip()
     }
     repo_root = Path(__file__).resolve().parents[2]
-    environment_metadata = _collect_environment_metadata(repo_root)
+    environment_metadata = _collect_environment_metadata(
+        repo_root,
+        subprocess_python_executable=args.subprocess_python_executable,
+        subprocess_pythonpath=args.subprocess_pythonpath,
+    )
     history_path = Path(args.history_json).expanduser() if args.history_json else None
     prior_history = _load_history_jsonl(history_path) if history_path else []
     if args.demo_preset is not None:
@@ -6542,6 +7043,30 @@ def main() -> int:
         else:
             _print_history_report(report)
         return 0
+    if (
+        args.subprocess_python_executable is not None
+        or args.subprocess_pythonpath is not None
+    ):
+        runtime_probe = _probe_subprocess_runtime_capabilities(
+            subprocess_python_executable=environment_metadata[
+                "subprocess_python_executable"
+            ],
+            requested_pythonpath=args.subprocess_pythonpath,
+        )
+        if not runtime_probe.get("import_ok"):
+            raise ValueError(
+                "The selected child runtime could not import mlx.core: "
+                f"{runtime_probe.get('error')}"
+            )
+        if not runtime_probe.get("extended_load_args_ok"):
+            raise ValueError(
+                "The selected child runtime does not support the benchmark's "
+                "extended mx.load(...) mmap arguments. This is expected for the "
+                "upstream MLX wheel. Use this runtime for --decode-cmd only, or "
+                "point --subprocess-python-executable at a build of this repo "
+                "that includes the mmap benchmark loader extensions.\n"
+                f"Probe: {runtime_probe.get('load_probe_error')}"
+            )
     if args.attempts > 1:
         print(
             "Consensus mode enabled: "
@@ -6558,6 +7083,14 @@ def main() -> int:
         f"git={git_head} host={host_chip} "
         f"python={environment_metadata['python_version']}"
     )
+    if not environment_metadata.get("subprocess_python_matches_parent"):
+        child_python = environment_metadata.get("subprocess_python_executable")
+        child_pythonpath = environment_metadata.get("subprocess_pythonpath")
+        print(
+            "Worker runtime: "
+            f"python={child_python} "
+            f"PYTHONPATH={child_pythonpath or '<cleared>'}"
+        )
     policy_knobs = requested_policy_knobs
     policy_signature = requested_policy_signature
     policy_summary_text = _policy_summary(policy_knobs)
@@ -6782,6 +7315,8 @@ def main() -> int:
                 args.cache_mode,
                 1 if args.cache_mode == "steady-state" else 0,
                 collect_mmap_stats=True,
+                subprocess_python_executable=args.subprocess_python_executable,
+                subprocess_pythonpath=args.subprocess_pythonpath,
             )[0]
             auto_policy_probe_stats = auto_policy_probe.get("mmap_stats")
             if auto_policy_probe_stats is not None:
@@ -6937,6 +7472,8 @@ def main() -> int:
                     decode_synth_repeats=args.decode_synth_repeats,
                     cache_mode=args.cache_mode,
                     worker_prime_loads=worker_prime_loads,
+                    subprocess_python_executable=args.subprocess_python_executable,
+                    subprocess_pythonpath=args.subprocess_pythonpath,
                 )
             else:
                 copy_trials = _run_trials(
@@ -6957,6 +7494,8 @@ def main() -> int:
                     args.decode_synth_repeats,
                     args.cache_mode,
                     worker_prime_loads,
+                    subprocess_python_executable=args.subprocess_python_executable,
+                    subprocess_pythonpath=args.subprocess_pythonpath,
                 )
                 mmap_trials = _run_trials(
                     script_path,
@@ -6976,6 +7515,8 @@ def main() -> int:
                     args.decode_synth_repeats,
                     args.cache_mode,
                     worker_prime_loads,
+                    subprocess_python_executable=args.subprocess_python_executable,
+                    subprocess_pythonpath=args.subprocess_pythonpath,
                 )
 
             copy_time = [x["elapsed_s"] for x in copy_trials]
@@ -7632,6 +8173,8 @@ def main() -> int:
                 "warm",
                 0,
                 collect_mmap_stats=False,
+                subprocess_python_executable=args.subprocess_python_executable,
+                subprocess_pythonpath=args.subprocess_pythonpath,
             )[0]
             cold_cache_validation = _assess_cold_cache_credibility(
                 cold_copy_time_s=copy_time_med,
@@ -7675,6 +8218,8 @@ def main() -> int:
                 "inherit",
                 0,
                 collect_mmap_stats=True,
+                subprocess_python_executable=args.subprocess_python_executable,
+                subprocess_pythonpath=args.subprocess_pythonpath,
             )[0]
             mmap_coverage = probe.get("mmap_stats")
             if mmap_coverage is not None:

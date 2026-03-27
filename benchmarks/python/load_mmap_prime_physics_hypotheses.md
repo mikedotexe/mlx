@@ -29,6 +29,79 @@ python /Users/mikepurvis/other/mlx/benchmarks/python/load_mmap_bench.py \
   --demo-preset persistence-memory
 ```
 
+## Curated Top Set From The Live Run
+
+The live scaffold run over the real repo produced `212` candidate fragments
+across `8` sources. These are the `8` claims I would keep at the top of the
+ledger because they are the cleanest fit for our claim-memory and replay system.
+
+### 1. Negative Results Must Persist
+
+- Claim: the system should remember that `k* ~ sqrt(M)`, `2p resonance`,
+  template-specific bonuses, boundary-digit specialness, and phase-lock stories
+  were explicitly tested and not supported.
+- Best sources: [NOVELTY.md](/Users/mikepurvis/Library/CloudStorage/Dropbox/Kairos/primes/prime-physics-engine/NOVELTY.md)
+- Why it matters to us: this is the cleanest memory-suppression test in the
+  whole corpus.
+
+### 2. The Density Story Should Stay Classical Unless Controls Separate
+
+- Claim: the membrane-vs-random-coprime ratio staying near `1` should push the
+  system toward a classical or control-dominated interpretation rather than a
+  novelty-heavy mechanism story.
+- Best sources: [EVIDENCE.md](/Users/mikepurvis/Library/CloudStorage/Dropbox/Kairos/primes/prime-physics-engine/EVIDENCE.md), [NOVELTY.md](/Users/mikepurvis/Library/CloudStorage/Dropbox/Kairos/primes/prime-physics-engine/NOVELTY.md)
+- Why it matters to us: it tests whether the loop can prefer "boring but right"
+  over "exciting but unsupported."
+
+### 3. Single-Instance Findings Must Stay Narrow
+
+- Claim: canonical asymmetries or memorable examples should remain explicitly
+  single-instance until the matrix broadens.
+- Best sources: [NOVELTY.md](/Users/mikepurvis/Library/CloudStorage/Dropbox/Kairos/primes/prime-physics-engine/NOVELTY.md), [EVIDENCE.md](/Users/mikepurvis/Library/CloudStorage/Dropbox/Kairos/primes/prime-physics-engine/EVIDENCE.md)
+- Why it matters to us: this is a direct scope-discipline test.
+
+### 4. Statistical Probes Should Stay Statistical
+
+- Claim: prime-outer-digit, discriminant, and Goldbach-richness stories should
+  remain contingent on significance, correlation, and effect size rather than
+  on memorable anecdotes.
+- Best sources: [prime_outer_analysis.py](/Users/mikepurvis/Library/CloudStorage/Dropbox/Kairos/primes/prime-physics-engine/prime_outer_analysis.py), [analyze_discriminant.py](/Users/mikepurvis/Library/CloudStorage/Dropbox/Kairos/primes/prime-physics-engine/analyze_discriminant.py)
+- Why it matters to us: these are ideal for forensics-style "suggestive vs
+  significant" replay cases.
+
+### 5. Formalization Increases Trust, Not Claim Size
+
+- Claim: Lean proof volume should strengthen local theorem families without
+  inflating the global density interpretation.
+- Best sources: [THEOREM_INDEX.md](/Users/mikepurvis/Library/CloudStorage/Dropbox/Kairos/primes/prime-physics-engine/lean-proofs/THEOREM_INDEX.md), [STATUS.md](/Users/mikepurvis/Library/CloudStorage/Dropbox/Kairos/primes/prime-physics-engine/STATUS.md)
+- Why it matters to us: this is the cleanest "local proof vs global narrative"
+  separation case.
+
+### 6. Tidal And Gravity Language Must Stay In The Metaphor Bucket
+
+- Claim: the tidal-analysis layer is explicitly a visualization surface and
+  should not be promoted into mathematical evidence.
+- Best sources: [src/tidal/mod.rs](/Users/mikepurvis/Library/CloudStorage/Dropbox/Kairos/primes/prime-physics-engine/src/tidal/mod.rs)
+- Why it matters to us: this is a strong terminology-audit case because the
+  source itself already gives the scope disclaimer.
+
+### 7. The Lean Surface Contains Real Local Mathematical Signal
+
+- Claim: midpoint obstruction, coprimality filters, admissible endings, unit
+  residue symmetry, and orbit-count statements are genuine proved local claims.
+- Best sources: [THEOREM_INDEX.md](/Users/mikepurvis/Library/CloudStorage/Dropbox/Kairos/primes/prime-physics-engine/lean-proofs/THEOREM_INDEX.md)
+- Why it matters to us: it gives us a genuine "proved" bucket instead of only
+  prose claims and code hypotheses.
+
+### 8. Verification Entry Points Are Evidence Surfaces, Not Claims
+
+- Claim: commands like `cargo test --lib`, `cargo clippy`, `lake build`, and
+  named example runners should increase confidence in the repo's evidence
+  surface without being mistaken for direct evidence of any single hypothesis.
+- Best sources: [STATUS.md](/Users/mikepurvis/Library/CloudStorage/Dropbox/Kairos/primes/prime-physics-engine/STATUS.md), [EVIDENCE.md](/Users/mikepurvis/Library/CloudStorage/Dropbox/Kairos/primes/prime-physics-engine/EVIDENCE.md)
+- Why it matters to us: it tests whether our system can distinguish "verification
+  infrastructure exists" from "claim is therefore true."
+
 ## Source Set
 
 Primary sources used in this tranche:
