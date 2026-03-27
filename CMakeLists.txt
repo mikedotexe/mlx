@@ -162,6 +162,23 @@ if(MLX_BUILD_METAL)
   find_program(MLX_XCRUN_EXECUTABLE xcrun REQUIRED)
 
   function(mlx_find_apple_sdk_tool TOOL OUT_VAR)
+    set(TOOLCHAIN_ARGS)
+    if(TOOL STREQUAL "metal" OR TOOL STREQUAL "metallib")
+      execute_process(
+        COMMAND ${MLX_XCRUN_EXECUTABLE} -sdk macosx --toolchain Metal --find ${TOOL}
+        RESULT_VARIABLE TOOLCHAIN_RESULT
+        OUTPUT_VARIABLE TOOLCHAIN_PATH
+        ERROR_VARIABLE TOOLCHAIN_ERROR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_STRIP_TRAILING_WHITESPACE)
+      if(TOOLCHAIN_RESULT EQUAL 0 AND NOT TOOLCHAIN_PATH STREQUAL "")
+        set(${OUT_VAR} "${TOOLCHAIN_PATH}" PARENT_SCOPE)
+        set(MLX_METAL_TOOLCHAIN_ARGS "--toolchain;Metal" CACHE INTERNAL
+                                                           "Arguments used to select the Metal toolchain")
+        return()
+      endif()
+    endif()
+
     execute_process(
       COMMAND ${MLX_XCRUN_EXECUTABLE} -sdk macosx --find ${TOOL}
       RESULT_VARIABLE TOOL_RESULT
