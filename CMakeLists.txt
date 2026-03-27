@@ -159,6 +159,26 @@ if(MLX_BUILD_CUDA)
 endif()
 
 if(MLX_BUILD_METAL)
+  find_program(MLX_XCRUN_EXECUTABLE xcrun REQUIRED)
+
+  function(mlx_find_apple_sdk_tool TOOL OUT_VAR)
+    execute_process(
+      COMMAND ${MLX_XCRUN_EXECUTABLE} -sdk macosx --find ${TOOL}
+      RESULT_VARIABLE TOOL_RESULT
+      OUTPUT_VARIABLE TOOL_PATH
+      ERROR_VARIABLE TOOL_ERROR
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_STRIP_TRAILING_WHITESPACE)
+    if(NOT TOOL_RESULT EQUAL 0 OR TOOL_PATH STREQUAL "")
+      message(
+        FATAL_ERROR
+          "MLX_BUILD_METAL=ON requires the Apple SDK tool '${TOOL}', but xcrun could not locate it. "
+          "${TOOL_ERROR} Install full Xcode or select a developer directory that provides '${TOOL}', "
+          "or configure with MLX_BUILD_METAL=OFF.")
+    endif()
+    set(${OUT_VAR} "${TOOL_PATH}" PARENT_SCOPE)
+  endfunction()
+
   find_library(METAL_LIB Metal)
   find_library(FOUNDATION_LIB Foundation)
   find_library(QUARTZ_LIB QuartzCore)
@@ -174,9 +194,18 @@ if(MLX_BUILD_METAL)
     add_compile_definitions(MLX_METAL_DEBUG)
   endif()
 
-  # Throw an error if xcrun not found
+  mlx_find_apple_sdk_tool(metal MLX_METAL_EXECUTABLE)
+  mlx_find_apple_sdk_tool(metallib MLX_METALLIB_EXECUTABLE)
+  set(MLX_METAL_EXECUTABLE "${MLX_METAL_EXECUTABLE}" CACHE INTERNAL
+                                                       "Resolved path to the Metal compiler")
+  set(MLX_METALLIB_EXECUTABLE
+      "${MLX_METALLIB_EXECUTABLE}"
+      CACHE INTERNAL "Resolved path to the metallib tool")
+  message(STATUS "Metal compiler found ${MLX_METAL_EXECUTABLE}")
+  message(STATUS "metallib found ${MLX_METALLIB_EXECUTABLE}")
+
   execute_process(
-    COMMAND zsh "-c" "/usr/bin/xcrun -sdk macosx --show-sdk-version"
+    COMMAND ${MLX_XCRUN_EXECUTABLE} -sdk macosx --show-sdk-version
     OUTPUT_VARIABLE MACOS_SDK_VERSION
     OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
 
@@ -199,7 +228,7 @@ if(MLX_BUILD_METAL)
   execute_process(
     COMMAND
       zsh "-c"
-      "echo \"__METAL_VERSION__\" | xcrun -sdk macosx metal ${XCRUN_FLAGS} -E -x metal -P - | tail -1 | tr -d '\n'"
+      "echo \"__METAL_VERSION__\" | '${MLX_METAL_EXECUTABLE}' ${XCRUN_FLAGS} -E -x metal -P - | tail -1 | tr -d '\n'"
     OUTPUT_VARIABLE MLX_METAL_VERSION COMMAND_ERROR_IS_FATAL ANY)
   FetchContent_Declare(metal_cpp URL ${METAL_CPP_URL})
   FetchContent_MakeAvailable(metal_cpp)

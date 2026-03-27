@@ -90,6 +90,11 @@ real safetensors probe may still fall back completely with reasons like
 `make_buffer_failed`, while a Metal-capable runtime is the lane where the
 shared-buffer story can actually be realized.
 
+On Metal-enabled repo builds, the mapped-loading tests also depend on a working
+Apple Metal toolchain. In practice that means both `metal` and `metallib` must
+be discoverable by `xcrun` at configure time so the runtime can build and load
+`mlx.metallib` instead of failing later during `ctest`.
+
 ## What The Benchmark Covers
 
 [`benchmarks/python/unified_memory_zero_copy_bench.py`](unified_memory_zero_copy_bench.py)

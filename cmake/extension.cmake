@@ -32,11 +32,17 @@ macro(mlx_build_metallib)
                                -frecord-sources)
   endif()
 
+  if(DEFINED MLX_METAL_EXECUTABLE AND NOT MLX_METAL_EXECUTABLE STREQUAL "")
+    set(MTLLIB_METAL_COMPILER ${MLX_METAL_EXECUTABLE})
+  else()
+    set(MTLLIB_METAL_COMPILER xcrun -sdk macosx metal)
+  endif()
+
   # Prepare metallib build command
   add_custom_command(
     OUTPUT ${MTLLIB_BUILD_TARGET}
     COMMAND
-      xcrun -sdk macosx metal
+      ${MTLLIB_METAL_COMPILER}
       "$<LIST:TRANSFORM,${MTLLIB_INCLUDE_DIRS},PREPEND,-I>"
       ${MTLLIB_COMPILE_OPTIONS} ${MTLLIB_SOURCES} -o ${MTLLIB_BUILD_TARGET}
     DEPENDS ${MTLLIB_DEPS} ${MTLLIB_SOURCES}
