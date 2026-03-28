@@ -11,7 +11,13 @@ import shlex
 import statistics
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+from _safetensors_repack_helper import (
+    repack_safetensors_file,
+    summarize_repacked_pair,
+)
 
 
 DEFAULT_WARMUP = 5
@@ -64,6 +70,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--compare-repacked",
+        action="store_true",
+        help=(
+            "When probing a repo safetensors file, compare the original mmap results "
+            "against an alignment-friendly repacked copy."
+        ),
+    )
+    parser.add_argument(
+        "--repacked-model-file",
+        default=None,
+        help=(
+            "Optional pre-created alignment-friendly safetensors file used when "
+            "--compare-repacked is enabled."
+        ),
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         default=DEFAULT_WARMUP,
@@ -81,7 +103,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=argparse.SUPPRESS,
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.repacked_model_file and not args.compare_repacked:
+        parser.error("--repacked-model-file requires --compare-repacked")
+    return args
 
 
 def _summarize_ns(samples: list[int]) -> dict[str, int]:
@@ -188,6 +213,9 @@ def _format_text(payload: dict) -> str:
     meta = payload["meta"]
     wheel = payload["results"]["wheel"]
     repo_probe = payload["results"]["repo_mmap_probe"]
+    repo_probe_repacked = payload["results"].get("repo_mmap_probe_repacked")
+    repack_summary = payload["results"].get("repack_summary")
+    repo_delta = payload["results"].get("repo_mmap_probe_delta")
 
     lines = [
         "Unified Memory / Zero-Copy Bench",
@@ -233,7 +261,119 @@ def _format_text(payload: dict) -> str:
         )
         if stats.get("fallback_reasons"):
             lines.append(f"  fallback_reasons={stats['fallback_reasons']}")
+    if repo_probe_repacked is not None:
+        lines.extend(["", "Repo mmap probe (repacked):"])
+        if not repo_probe_repacked["available"]:
+            lines.append(f"  skipped: {repo_probe_repacked['reason']}")
+        else:
+            lines.append(
+                f"  load median={_format_ns(repo_probe_repacked['load_ns']['median_ns'])}"
+            )
+            stats = repo_probe_repacked.get("mmap_stats", {})
+            lines.append(
+                "  mmap: "
+                f"mapped_bytes={stats.get('mapped_bytes')} "
+                f"copied_bytes={stats.get('copied_bytes')} "
+                f"fallback_tensors={stats.get('fallback_tensors')}"
+            )
+            if stats.get("fallback_reasons"):
+                lines.append(f"  fallback_reasons={stats['fallback_reasons']}")
+        if repack_summary is not None:
+            lines.append(
+                "  repack: "
+                f"padding_added={repack_summary['total_padding_bytes_added']} "
+                f"payload_start_before={repack_summary['payload_start_before']} "
+                f"payload_start_after={repack_summary['payload_start_after']} "
+                f"expected_to_eliminate_misaligned_offset="
+                f"{repack_summary['expected_to_eliminate_misaligned_offset']}"
+            )
+        if repo_delta is not None:
+            if not repo_delta["available"]:
+                lines.append(f"Compare: {repo_delta['reason']}")
+            else:
+                lines.append(
+                    "Compare: "
+                    f"mapped_bytes_delta={repo_delta['mapped_bytes_delta']} "
+                    f"copied_bytes_delta={repo_delta['copied_bytes_delta']} "
+                    f"fallback_tensors_delta={repo_delta['fallback_tensors_delta']} "
+                    f"load_median_ns_delta={repo_delta['load_median_ns_delta']} "
+                    f"improved_mapping={repo_delta['improved_mapping']}"
+                )
+                reason_changes = repo_delta["fallback_reason_change_summary"]
+                if reason_changes["delta"]:
+                    lines.append(
+                        "  fallback_reason_delta="
+                        f"{reason_changes['delta']}"
+                    )
     return "\n".join(lines)
+
+
+def _fallback_reason_change_summary(
+    before: dict[str, int] | None, after: dict[str, int] | None
+) -> dict:
+    before = {key: int(value) for key, value in (before or {}).items()}
+    after = {key: int(value) for key, value in (after or {}).items()}
+    delta = {}
+    removed = []
+    added = []
+    for key in sorted(set(before) | set(after)):
+        before_value = before.get(key, 0)
+        after_value = after.get(key, 0)
+        if before_value != after_value:
+            delta[key] = after_value - before_value
+        if before_value and not after_value:
+            removed.append(key)
+        if after_value and not before_value:
+            added.append(key)
+    return {
+        "before": before,
+        "after": after,
+        "delta": delta,
+        "removed": removed,
+        "added": added,
+    }
+
+
+def _build_repo_mmap_probe_delta(original: dict, repacked: dict) -> dict:
+    if not original.get("available") or not repacked.get("available"):
+        missing = []
+        if not original.get("available"):
+            missing.append(f"original probe unavailable: {original.get('reason', 'unknown')}")
+        if not repacked.get("available"):
+            missing.append(f"repacked probe unavailable: {repacked.get('reason', 'unknown')}")
+        return {
+            "available": False,
+            "reason": "; ".join(missing) or "repo mmap comparison unavailable",
+        }
+
+    original_stats = original.get("mmap_stats") or {}
+    repacked_stats = repacked.get("mmap_stats") or {}
+    mapped_delta = int(repacked_stats.get("mapped_bytes", 0)) - int(
+        original_stats.get("mapped_bytes", 0)
+    )
+    copied_delta = int(repacked_stats.get("copied_bytes", 0)) - int(
+        original_stats.get("copied_bytes", 0)
+    )
+    fallback_delta = int(repacked_stats.get("fallback_tensors", 0)) - int(
+        original_stats.get("fallback_tensors", 0)
+    )
+    load_delta = int(repacked["load_ns"]["median_ns"]) - int(
+        original["load_ns"]["median_ns"]
+    )
+    return {
+        "available": True,
+        "mapped_bytes_delta": mapped_delta,
+        "copied_bytes_delta": copied_delta,
+        "fallback_tensors_delta": fallback_delta,
+        "load_median_ns_delta": load_delta,
+        "fallback_reason_change_summary": _fallback_reason_change_summary(
+            original_stats.get("fallback_reasons"),
+            repacked_stats.get("fallback_reasons"),
+        ),
+        "improved_mapping": (
+            mapped_delta > 0 or copied_delta < 0 or fallback_delta < 0
+        ),
+    }
 
 
 def _run_wheel_cases(*, warmup: int, runs: int) -> dict:
@@ -425,6 +565,8 @@ def main(argv: list[str] | None = None) -> int:
             "wheel_python": args.wheel_python,
             "repo_pythonpath": args.repo_pythonpath,
             "model_file": args.model_file,
+            "compare_repacked": bool(args.compare_repacked),
+            "repacked_model_file": args.repacked_model_file,
         },
         "results": {
             "wheel": {
@@ -456,6 +598,61 @@ def main(argv: list[str] | None = None) -> int:
             runs=args.runs,
             model_file=args.model_file,
         )
+        if args.compare_repacked:
+            if not args.model_file:
+                payload["results"]["repo_mmap_probe_repacked"] = {
+                    "available": False,
+                    "reason": "--model-file is required for --compare-repacked.",
+                }
+                payload["results"]["repo_mmap_probe_delta"] = {
+                    "available": False,
+                    "reason": "--model-file is required for --compare-repacked.",
+                }
+            else:
+                try:
+                    if args.repacked_model_file:
+                        repacked_model_file = args.repacked_model_file
+                        repack_summary = summarize_repacked_pair(
+                            args.model_file, repacked_model_file
+                        )
+                        payload["results"]["repack_summary"] = repack_summary
+                        payload["results"]["repo_mmap_probe_repacked"] = _run_child(
+                            python_executable=sys.executable,
+                            lane="repo_mmap",
+                            repo_pythonpath=args.repo_pythonpath,
+                            warmup=args.warmup,
+                            runs=args.runs,
+                            model_file=repacked_model_file,
+                        )
+                    else:
+                        with tempfile.TemporaryDirectory(
+                            prefix="mlx-repacked-bench-"
+                        ) as tmp_dir:
+                            repacked_model_path = Path(tmp_dir) / (
+                                f"{Path(args.model_file).stem}.aligned.safetensors"
+                            )
+                            repack_summary = repack_safetensors_file(
+                                args.model_file,
+                                output_path=repacked_model_path,
+                            )
+                            payload["results"]["repack_summary"] = repack_summary
+                            payload["results"]["repo_mmap_probe_repacked"] = _run_child(
+                                python_executable=sys.executable,
+                                lane="repo_mmap",
+                                repo_pythonpath=args.repo_pythonpath,
+                                warmup=args.warmup,
+                                runs=args.runs,
+                                model_file=str(repacked_model_path),
+                            )
+                except Exception as exc:
+                    payload["results"]["repo_mmap_probe_repacked"] = {
+                        "available": False,
+                        "reason": f"repack comparison failed: {exc}",
+                    }
+                payload["results"]["repo_mmap_probe_delta"] = _build_repo_mmap_probe_delta(
+                    payload["results"]["repo_mmap_probe"],
+                    payload["results"]["repo_mmap_probe_repacked"],
+                )
 
     if args.format == "json":
         print(json.dumps(payload, indent=2, sort_keys=True))

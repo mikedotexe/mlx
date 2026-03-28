@@ -252,7 +252,12 @@ class TestLoad(mlx_tests.MLXTestCase):
             self.assertGreater(stats["mapped_bytes"], 0)
         else:
             self.assertEqual(stats["mapped_bytes"], 0)
-            self.assertEqual(stats["fallback_reasons"].get("make_buffer_failed"), 1)
+            fallback_reasons = stats["fallback_reasons"]
+            self.assertEqual(
+                fallback_reasons.get("make_buffer_failed", 0)
+                + fallback_reasons.get("misaligned_offset", 0),
+                1,
+            )
         self.assertGreaterEqual(stats["copied_bytes"], 0)
         self.assertIn("fallback_tensors", stats)
         self.assertIn("fallback_reasons", stats)
