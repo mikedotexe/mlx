@@ -5,6 +5,7 @@ import os
 import platform
 import re
 import subprocess
+import sys
 from functools import partial
 from pathlib import Path
 
@@ -96,6 +97,9 @@ class CMakeBuild(build_ext):
             "-DMLX_BUILD_BENCHMARKS=OFF",
             "-DMLX_BUILD_EXAMPLES=OFF",
             "-DBUILD_SHARED_LIBS=ON",
+            f"-DPython_EXECUTABLE={sys.executable}",
+            f"-DPython_ROOT_DIR={sys.prefix}",
+            "-DPython_FIND_STRATEGY=LOCATION",
         ]
         if build_stage == 2 and build_cuda:
             # Last arch is always real and virtual for forward-compatibility

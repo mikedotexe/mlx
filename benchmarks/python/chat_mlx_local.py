@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -569,27 +570,21 @@ def _default_model_specs(repo_root: Path) -> list[dict[str, str]]:
     candidates = [
         {
             "label": "qwen",
-            "path": (
-                repo_root
-                / ".local_models"
-                / "qwen2.5-1.5b-instruct-mlx-4bit"
-                / "model.safetensors"
-            ),
+            "dir": repo_root / ".local_models" / "qwen2.5-1.5b-instruct-mlx-4bit",
         },
         {
             "label": "tinyllama",
-            "path": (
-                repo_root
-                / ".local_models"
-                / "tinyllama-1.1b-chat-mlx-4bit"
-                / "model.safetensors"
-            ),
+            "dir": repo_root / ".local_models" / "tinyllama-1.1b-chat-mlx-4bit",
+        },
+        {
+            "label": "gemma3-12b",
+            "dir": repo_root / ".local_models" / "gemma-3-12b-it-4bit",
         },
     ]
     return [
-        {"label": spec["label"], "path": str(spec["path"])}
+        {"label": spec["label"], "path": str(spec["dir"].resolve())}
         for spec in candidates
-        if Path(spec["path"]).exists()
+        if (spec["dir"] / "config.json").exists()
     ]
 
 
@@ -5634,9 +5629,16 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-label",
-        choices=["qwen", "tinyllama"],
+        choices=["qwen", "tinyllama", "gemma3-12b"],
         default=None,
         help="Convenience selector for default local models.",
+    )
+    parser.add_argument(
+        "--model-memory-map",
+        action="store_true",
+        default=os.environ.get("CHAT_MLX_LOCAL_MODEL_MEMORY_MAP", "").strip().lower()
+        in {"1", "true", "yes", "on"},
+        help="Request explicit memory-mapped model loading when supported.",
     )
     parser.add_argument(
         "--architecture",
@@ -5810,17 +5812,146 @@ def _format_profiling_summary(profile: dict[str, object] | None) -> str | None:
     return f"Profiling ({prefix}): " + ", ".join(items) + "."
 
 
+def _runtime_identity() -> dict[str, object]:
+    runtime: dict[str, object] = {
+        "python": sys.executable,
+    }
+    try:
+        import mlx.core as mx
+
+        runtime["mlx_core_path"] = inspect.getfile(mx)
+        runtime["has_mmap_stats"] = bool(hasattr(mx, "last_mmap_load_stats"))
+    except Exception as exc:  # pragma: no cover - defensive
+        runtime["mlx_core_path_error"] = str(exc)
+        runtime["has_mmap_stats"] = False
+    try:
+        import mlx_lm
+
+        runtime["mlx_lm_path"] = inspect.getfile(mlx_lm)
+    except Exception as exc:  # pragma: no cover - defensive
+        runtime["mlx_lm_path_error"] = str(exc)
+    return runtime
+
+
+def _merge_count_map(target: dict[str, int], source: dict[str, object] | None) -> None:
+    for key, value in dict(source or {}).items():
+        target[str(key)] = int(target.get(str(key), 0)) + int(value or 0)
+
+
+def _build_runtime_audit(
+    args: argparse.Namespace,
+    *,
+    load_seconds: float | None = None,
+    profiling: dict[str, object] | None = None,
+) -> dict[str, object]:
+    audit = dict(getattr(args, "_runtime_audit", {}) or {})
+    runtime = dict(audit.get("runtime", {}) or {})
+    load = dict(audit.get("load", {}) or {})
+    if load_seconds is not None:
+        load["load_seconds"] = float(load_seconds)
+    candidate_profile = dict((profiling or {}).get("candidate_profile", {}) or {})
+    generation = {
+        "candidate_generation_seconds": float(
+            (profiling or {}).get("candidate_generation_seconds", 0.0) or 0.0
+        ),
+        "first_token_seconds": float(
+            candidate_profile.get("max_first_token_seconds", 0.0) or 0.0
+        ),
+        "generated_tokens": int(candidate_profile.get("total_generated_tokens", 0) or 0),
+        "total_turn_seconds": float(
+            (profiling or {}).get("total_turn_seconds", 0.0) or 0.0
+        ),
+    }
+    if generation["candidate_generation_seconds"] > 0.0:
+        generation["tok_per_second"] = (
+            float(generation["generated_tokens"])
+            / generation["candidate_generation_seconds"]
+            if generation["generated_tokens"] > 0
+            else 0.0
+        )
+    audit["runtime"] = runtime
+    audit["load"] = load
+    audit["generation"] = generation
+    return audit
+
+
 def _load_runtime(args: argparse.Namespace, model_dir: str):
     from mlx_lm import load
 
+    import mlx.core as mx
+
+    runtime = _runtime_identity()
+    load_audit: dict[str, object] = {
+        "memory_map_requested": bool(getattr(args, "model_memory_map", False)),
+        "memory_map_effective": bool(
+            getattr(args, "model_memory_map", False) and runtime.get("has_mmap_stats")
+        ),
+        "can_report_mapped_vs_copied": bool(runtime.get("has_mmap_stats")),
+        "mapped_bytes": 0,
+        "copied_bytes": 0,
+        "fallback_reasons": {},
+        "fallback_reason_bytes": {},
+        "mx_load_calls": 0,
+        "mx_load_wall_seconds": 0.0,
+    }
+    original_mx_load = mx.load
+
+    def audited_mx_load(file, *load_args, **load_kwargs):
+        if load_audit["memory_map_effective"] and isinstance(
+            file, (str, os.PathLike, Path)
+        ):
+            load_kwargs.setdefault("memory_map", True)
+        call_start = time.perf_counter()
+        result = original_mx_load(file, *load_args, **load_kwargs)
+        load_audit["mx_load_calls"] = int(load_audit["mx_load_calls"]) + 1
+        load_audit["mx_load_wall_seconds"] = float(
+            load_audit["mx_load_wall_seconds"]
+        ) + (time.perf_counter() - call_start)
+        if runtime.get("has_mmap_stats"):
+            try:
+                stats = mx.last_mmap_load_stats(clear=True)
+            except Exception as exc:  # pragma: no cover - defensive
+                load_audit["last_mmap_load_stats_error"] = str(exc)
+                stats = None
+            if stats:
+                load_audit["mapped_bytes"] = int(load_audit["mapped_bytes"]) + int(
+                    stats.get("mapped_bytes") or 0
+                )
+                load_audit["copied_bytes"] = int(load_audit["copied_bytes"]) + int(
+                    stats.get("copied_bytes") or 0
+                )
+                _merge_count_map(
+                    load_audit["fallback_reasons"], stats.get("fallback_reasons")
+                )
+                _merge_count_map(
+                    load_audit["fallback_reason_bytes"],
+                    stats.get("fallback_reason_bytes"),
+                )
+        return result
+
+    mx.load = audited_mx_load
     tokenizer_config = {"trust_remote_code": True} if args.trust_remote_code else None
-    load_start = time.time()
-    if tokenizer_config is not None:
-        model, tokenizer = load(model_dir, tokenizer_config=tokenizer_config)
-    else:
-        model, tokenizer = load(model_dir)
-    load_seconds = time.time() - load_start
-    return model, tokenizer, load_seconds
+    try:
+        if runtime.get("has_mmap_stats"):
+            try:
+                mx.last_mmap_load_stats(clear=True)
+            except Exception:
+                pass
+        load_start = time.perf_counter()
+        if tokenizer_config is not None:
+            model, tokenizer = load(model_dir, tokenizer_config=tokenizer_config)
+        else:
+            model, tokenizer = load(model_dir)
+        load_seconds = time.perf_counter() - load_start
+    finally:
+        mx.load = original_mx_load
+
+    total_bytes = int(load_audit["mapped_bytes"]) + int(load_audit["copied_bytes"])
+    load_audit["load_seconds"] = load_seconds
+    load_audit["mapped_ratio_pct"] = (
+        100.0 * int(load_audit["mapped_bytes"]) / total_bytes if total_bytes else 0.0
+    )
+    return model, tokenizer, load_seconds, {"runtime": runtime, "load": load_audit}
 
 
 def _build_prompt_text(
@@ -7000,6 +7131,11 @@ def _run_eval_turn(
     )
     profiling["diagnostics_seconds"] = time.perf_counter() - stage_start
     profiling["total_turn_seconds"] = time.perf_counter() - turn_start
+    profiling["runtime_audit"] = _build_runtime_audit(
+        args,
+        load_seconds=float(getattr(args, "_load_seconds", 0.0) or 0.0),
+        profiling=profiling,
+    )
     reflective_thread_active = reflective_thread_active or _answer_establishes_reflective_thread(assistant_text)
     field_score, _details = _score_field_alignment(actual_field, field_intent)
     latent = dict(reservoir_state.get("reservoir_latent", {}) or {})
@@ -7391,6 +7527,11 @@ def _run_single_prompt(
     )
     profiling["diagnostics_seconds"] = time.perf_counter() - stage_start
     profiling["total_turn_seconds"] = time.perf_counter() - turn_start
+    profiling["runtime_audit"] = _build_runtime_audit(
+        args,
+        load_seconds=load_seconds,
+        profiling=profiling,
+    )
     if args.json:
         tuning = dict(final_state.get("self_tuning", {}) or {})
         print(
@@ -7792,7 +7933,9 @@ def main() -> int:
     )
     model_path = Path(model_spec["path"]).expanduser().resolve()
     model_dir = str(model_path if model_path.is_dir() else model_path.parent)
-    model, tokenizer, load_seconds = _load_runtime(args, model_dir)
+    model, tokenizer, load_seconds, runtime_audit = _load_runtime(args, model_dir)
+    args._runtime_audit = runtime_audit
+    args._load_seconds = load_seconds
     embedding_field_probe = _build_embedding_field_probe(model, tokenizer)
     args.system_prompt = _resolve_system_prompt(args)
     controller = _build_reservoir_controller(
